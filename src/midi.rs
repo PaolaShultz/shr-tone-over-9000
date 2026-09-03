@@ -356,20 +356,22 @@ fn connect(
         _ => bail!("MIDI input {wanted:?} is ambiguous"),
     };
     let name = stable_identity(&names[index]);
-    let connection = input.connect(
-        &ports[index],
-        "rpi-tone-over-9000 monitor",
-        move |_stamp, message, _| {
-            if message.len() >= 3 {
-                let _ = sender.send(RawMidi {
-                    status: message[0],
-                    data1: message[1],
-                    data2: message[2],
-                });
-            }
-        },
-        (),
-    )?;
+    let connection = input
+        .connect(
+            &ports[index],
+            "rpi-tone-over-9000 monitor",
+            move |_stamp, message, _| {
+                if message.len() >= 3 {
+                    let _ = sender.send(RawMidi {
+                        status: message[0],
+                        data1: message[1],
+                        data2: message[2],
+                    });
+                }
+            },
+            (),
+        )
+        .map_err(|error| anyhow::anyhow!("connect MIDI input: {error}"))?;
     Ok((connection, name))
 }
 

@@ -1,6 +1,6 @@
-use crate::nam::NamModel;
+use crate::nam::NamChain;
 use crate::params::{db_to_gain, Parameters};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use jack::{
     AsyncClient, AudioIn, AudioOut, Client, ClientOptions, ClientStatus, Control,
     NotificationHandler, Port, ProcessHandler, ProcessScope,
@@ -26,7 +26,7 @@ impl AudioTelemetry {
             xruns: self.inner.xruns.load(Ordering::Relaxed),
             process_fault: self.inner.process_fault.load(Ordering::Relaxed),
             server_lost: self.inner.server_lost.load(Ordering::Relaxed),
-            model_active: self.inner.model_active.load(Ordering::Relaxed),
+            chain_len: self.inner.chain_len.load(Ordering::Relaxed),
         }
     }
 }
@@ -40,7 +40,7 @@ pub struct TelemetrySnapshot {
     pub xruns: u64,
     pub process_fault: bool,
     pub server_lost: bool,
-    pub model_active: bool,
+    pub chain_len: u32,
 }
 
 struct TelemetryInner {
@@ -51,7 +51,7 @@ struct TelemetryInner {
     xruns: AtomicU64,
     process_fault: AtomicBool,
     server_lost: AtomicBool,
-    model_active: AtomicBool,
+    chain_len: AtomicU32,
 }
 
 impl Default for TelemetryInner {
@@ -64,7 +64,7 @@ impl Default for TelemetryInner {
             xruns: AtomicU64::new(0),
             process_fault: AtomicBool::new(false),
             server_lost: AtomicBool::new(false),
-            model_active: AtomicBool::new(false),
+            chain_len: AtomicU32::new(0),
         }
     }
 }
@@ -73,8 +73,8 @@ type Active = AsyncClient<AudioNotifications, AudioProcess>;
 
 pub struct AudioClient {
     active: Option<Active>,
-    model_tx: Producer<NamModel>,
-    retired_rx: Consumer<NamModel>,
+    command_tx: Producer<AudioCommand>,
+    retired_rx: Consumer<NamChain>,
     telemetry: AudioTelemetry,
     period_frames: u32,
     input_port_name: String,
@@ -120,7 +120,7 @@ impl AudioClient {
         let input_port_name = input.name().context("read JACK input port name")?;
         let output_port_name = output.name().context("read JACK output port name")?;
 
-        let (model_tx, model_rx) = RingBuffer::new(2);
+        let (command_tx, command_rx) = RingBuffer::new(4);
         let (retired_tx, retired_rx) = RingBuffer::new(2);
         let inner = Arc::new(TelemetryInner::default());
         let telemetry = AudioTelemetry {
@@ -133,9 +133,9 @@ impl AudioClient {
             expected_period,
             params,
             telemetry: Arc::clone(&inner),
-            model_rx,
+            command_rx,
             retired_tx,
-            active_model: None,
+            active_chain: None,
             pending_retire: None,
         };
         let notifications = AudioNotifications {
@@ -167,7 +167,7 @@ impl AudioClient {
 
         Ok(Self {
             active: Some(active),
-            model_tx,
+            command_tx,
             retired_rx,
             telemetry,
             period_frames: expected_period,
@@ -193,12 +193,24 @@ impl AudioClient {
             .unwrap_or(0.0)
     }
 
-    pub fn queue_model(&mut self, model: NamModel) -> Result<()> {
+    pub fn queue_chain(&mut self, chain: NamChain) -> Result<()> {
         self.drain_retired();
-        match self.model_tx.push(model) {
+        match self.command_tx.push(AudioCommand::ReplaceChain(chain)) {
             Ok(()) => Ok(()),
-            Err(PushError::Full(_model)) => {
-                bail!("audio model handoff is busy; try loading again")
+            Err(PushError::Full(_command)) => {
+                bail!("audio chain handoff is busy; try the edit again")
+            }
+        }
+    }
+
+    pub fn queue_cabinet_variant(&mut self, slot: usize, variant: usize) -> Result<()> {
+        match self
+            .command_tx
+            .push(AudioCommand::SelectCabinet { slot, variant })
+        {
+            Ok(()) => Ok(()),
+            Err(PushError::Full(_command)) => {
+                bail!("audio control handoff is busy; try the edit again")
             }
         }
     }
@@ -216,17 +228,12 @@ impl AudioClient {
             return Ok(());
         };
         let client = active.as_client();
-        let input_disconnect = client
-            .disconnect_ports_by_name(&self.capture_port, &self.input_port_name)
-            .err();
-        let output_disconnect = client
-            .disconnect_ports_by_name(&self.output_port_name, &self.playback_port)
-            .err();
+        // JACK routes may be removed independently while the client is live.
+        // Disconnect is therefore best-effort; deactivation owns shutdown.
+        let _ = client.disconnect_ports_by_name(&self.capture_port, &self.input_port_name);
+        let _ = client.disconnect_ports_by_name(&self.output_port_name, &self.playback_port);
         active.deactivate().context("deactivate JACK client")?;
         self.drain_retired();
-        if let Some(error) = input_disconnect.or(output_disconnect) {
-            return Err(anyhow!(error)).context("disconnect owned JACK ports");
-        }
         Ok(())
     }
 }
@@ -266,10 +273,15 @@ struct AudioProcess {
     expected_period: u32,
     params: Arc<Parameters>,
     telemetry: Arc<TelemetryInner>,
-    model_rx: Consumer<NamModel>,
-    retired_tx: Producer<NamModel>,
-    active_model: Option<NamModel>,
-    pending_retire: Option<NamModel>,
+    command_rx: Consumer<AudioCommand>,
+    retired_tx: Producer<NamChain>,
+    active_chain: Option<NamChain>,
+    pending_retire: Option<NamChain>,
+}
+
+enum AudioCommand {
+    ReplaceChain(NamChain),
+    SelectCabinet { slot: usize, variant: usize },
 }
 
 impl AudioProcess {
@@ -282,23 +294,40 @@ impl AudioProcess {
         }
     }
 
-    fn accept_model(&mut self) {
+    fn accept_commands(&mut self) {
         self.publish_retired();
         if self.pending_retire.is_some() {
             return;
         }
-        let Ok(model) = self.model_rx.pop() else {
-            return;
-        };
-        self.pending_retire = self.active_model.replace(model);
-        self.telemetry.model_active.store(true, Ordering::Relaxed);
-        self.publish_retired();
+        while let Ok(command) = self.command_rx.pop() {
+            match command {
+                AudioCommand::ReplaceChain(chain) => {
+                    self.telemetry
+                        .chain_len
+                        .store(chain.len() as u32, Ordering::Relaxed);
+                    self.pending_retire = self.active_chain.replace(chain);
+                    self.publish_retired();
+                    if self.pending_retire.is_some() {
+                        return;
+                    }
+                }
+                AudioCommand::SelectCabinet { slot, variant } => {
+                    if !self
+                        .active_chain
+                        .as_mut()
+                        .is_some_and(|chain| chain.select_cabinet_variant(slot, variant))
+                    {
+                        self.telemetry.process_fault.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
     }
 }
 
 impl ProcessHandler for AudioProcess {
     fn process(&mut self, _client: &Client, process_scope: &ProcessScope) -> Control {
-        self.accept_model();
+        self.accept_commands();
         let input = self.input.as_slice(process_scope);
         let output = self.output.as_mut_slice(process_scope);
         if input.len() != self.expected_period as usize
@@ -321,8 +350,8 @@ impl ProcessHandler for AudioProcess {
         let processed = if parameters.bypass {
             output.copy_from_slice(scratch);
             true
-        } else if let Some(model) = self.active_model.as_mut() {
-            model.process(scratch, output)
+        } else if let Some(chain) = self.active_chain.as_mut() {
+            chain.process(scratch, output)
         } else {
             output.fill(0.0);
             true

@@ -1,7 +1,7 @@
 use crate::audio::{AudioClient, AudioTelemetry, TelemetrySnapshot};
 use crate::midi::{MidiAction, MidiController};
 use crate::model_dir::ModelDirectory;
-use crate::nam::{ModelMetadata, NamModel};
+use crate::nam::{ModelMetadata, NamChain};
 use crate::params::{ParamId, Parameters};
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::fs;
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ const WIDTH: u16 = 40;
 const HEIGHT: u16 = 13;
 const TICK: Duration = Duration::from_millis(33);
 const STATUS_LIFETIME: Duration = Duration::from_secs(3);
+const MAX_CHAIN_MODELS: usize = 4;
 
 pub fn run(
     audio: &mut AudioClient,
@@ -81,6 +82,9 @@ fn run_loop(
 ) -> Result<()> {
     let telemetry = audio.telemetry();
     let mut app = App::new(telemetry, params);
+    if let Some(warning) = models.take_metadata_warning() {
+        app.set_status(warning, true);
+    }
     if let Some(error) = midi.startup_error() {
         app.set_status(format!("MIDI {error}"), false);
     }
@@ -90,6 +94,9 @@ fn run_loop(
         audio.drain_retired();
         if let Err(error) = models.poll_watch() {
             app.set_status(error.to_string(), true);
+        }
+        if let Some(warning) = models.take_metadata_warning() {
+            app.set_status(warning, true);
         }
         while let Some(action) = midi.next_action(&app.params) {
             handle_midi(action, &mut app, audio, models, midi);
@@ -119,7 +126,10 @@ fn run_loop(
 struct App {
     params: Arc<Parameters>,
     telemetry: AudioTelemetry,
-    loaded: Option<ModelMetadata>,
+    chain: Vec<ModelMetadata>,
+    cabinet_variants: Vec<Vec<ModelMetadata>>,
+    chain_focus: usize,
+    mic_focus: bool,
     focus: ParamId,
     help: bool,
     quit: bool,
@@ -145,7 +155,10 @@ impl App {
         Self {
             params,
             telemetry,
-            loaded: None,
+            chain: Vec::new(),
+            cabinet_variants: Vec::new(),
+            chain_focus: 0,
+            mic_focus: false,
             focus: ParamId::InputGain,
             help: false,
             quit: false,
@@ -195,10 +208,18 @@ fn handle_key(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.help = true,
-        KeyCode::Up | KeyCode::Char('-') => models.select_relative(-1),
-        KeyCode::Down | KeyCode::Char('+') => models.select_relative(1),
-        KeyCode::Enter => load_selected(app, audio, models, midi),
-        KeyCode::Char('r') => reload_current(app, audio, midi),
+        KeyCode::Up | KeyCode::Char('-') => browse_or_select_mic(app, audio, models, midi, -1),
+        KeyCode::Down | KeyCode::Char('+') => browse_or_select_mic(app, audio, models, midi, 1),
+        KeyCode::Left => focus_chain_relative(app, -1),
+        KeyCode::Right => focus_chain_relative(app, 1),
+        KeyCode::Enter => replace_focused(app, audio, models, midi),
+        KeyCode::Char('a') => add_selected(app, audio, models, midi),
+        KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+            remove_focused(app, audio, models, midi)
+        }
+        KeyCode::Char('[') => move_focused(app, audio, models, midi, -1),
+        KeyCode::Char(']') => move_focused(app, audio, models, midi, 1),
+        KeyCode::Char('r') => reload_chain(app, audio, models, midi),
         KeyCode::Char('i' | 'I') => {
             app.focus = ParamId::InputGain;
             app.params
@@ -247,10 +268,11 @@ fn handle_mouse(
         return;
     }
     match mouse.kind {
-        MouseEventKind::ScrollUp => models.select_relative(-1),
-        MouseEventKind::ScrollDown => models.select_relative(1),
+        MouseEventKind::ScrollUp => browse_or_select_mic(app, audio, models, midi, -1),
+        MouseEventKind::ScrollDown => browse_or_select_mic(app, audio, models, midi, 1),
         MouseEventKind::Down(MouseButton::Left) => match mouse.row {
-            5 => load_selected(app, audio, models, midi),
+            0 => focus_chain_relative(app, if mouse.column < 20 { -1 } else { 1 }),
+            5 => replace_focused(app, audio, models, midi),
             6 | 7 => {
                 let parameter = parameter_at_column(mouse.column);
                 app.focus = parameter;
@@ -271,6 +293,14 @@ fn handle_mouse(
                     app.set_status(format!("LEARN {} · MOVE NEXT CC", app.focus.label()), false);
                 }
             }
+            9 => match mouse.column {
+                0..=9 => focus_chain_relative(app, -1),
+                10..=19 if app.mic_focus => select_mic_variant(app, audio, models, midi, -1),
+                20..=29 if app.mic_focus => select_mic_variant(app, audio, models, midi, 1),
+                10..=19 => add_selected(app, audio, models, midi),
+                20..=29 => remove_focused(app, audio, models, midi),
+                _ => focus_chain_relative(app, 1),
+            },
             _ => {}
         },
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -304,8 +334,8 @@ fn handle_midi(
     midi: &mut MidiController,
 ) {
     match action {
-        MidiAction::Select(direction) => models.select_relative(direction),
-        MidiAction::Load => load_selected(app, audio, models, midi),
+        MidiAction::Select(direction) => browse_or_select_mic(app, audio, models, midi, direction),
+        MidiAction::Load => replace_focused(app, audio, models, midi),
         MidiAction::Parameter(parameter) => app.focus = parameter,
         MidiAction::Learned {
             parameter,
@@ -322,44 +352,293 @@ fn handle_midi(
     }
 }
 
-fn load_selected(
+fn selected_path(models: &ModelDirectory) -> Option<PathBuf> {
+    models.selected().map(|entry| entry.path.clone())
+}
+
+fn replace_focused(
     app: &mut App,
     audio: &mut AudioClient,
     models: &ModelDirectory,
     midi: &mut MidiController,
 ) {
-    let Some(entry) = models.selected() else {
+    if app.mic_focus {
+        app.set_status("UP/DOWN SELECTS THIS CAB'S MIC VARIANT", false);
+        return;
+    }
+    let Some(path) = selected_path(models) else {
         app.set_status(
-            format!("NO .NAM FILES IN {}", models.root().display()),
+            format!("NO .NAM/.WAV FILES IN {}", models.root().display()),
             true,
         );
         return;
     };
-    load_path(&entry.path, app, audio, midi);
+    let mut paths = chain_paths(app);
+    let focus = app.chain_focus.min(paths.len().saturating_sub(1));
+    if paths.is_empty() {
+        paths.push(path);
+    } else {
+        paths[focus] = path;
+    }
+    publish_chain(paths, (focus, false), "REPLACED", app, audio, models, midi);
 }
 
-fn reload_current(app: &mut App, audio: &mut AudioClient, midi: &mut MidiController) {
-    let Some(path) = app.loaded.as_ref().map(|metadata| metadata.path.clone()) else {
-        app.set_status("NO CURRENT MODEL TO RELOAD", true);
+fn add_selected(
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &ModelDirectory,
+    midi: &mut MidiController,
+) {
+    if app.mic_focus {
+        app.set_status("MIC IS VIRTUAL · LEFT TO ADD A DSP SLOT", false);
+        return;
+    }
+    if app.chain.len() >= MAX_CHAIN_MODELS {
+        app.set_status(format!("CHAIN LIMIT IS {MAX_CHAIN_MODELS} SLOTS"), true);
+        return;
+    }
+    let Some(path) = selected_path(models) else {
+        app.set_status(
+            format!("NO .NAM/.WAV FILES IN {}", models.root().display()),
+            true,
+        );
         return;
     };
-    load_path(&path, app, audio, midi);
+    let mut paths = chain_paths(app);
+    let focus = if paths.is_empty() {
+        paths.push(path);
+        0
+    } else {
+        let index = app.chain_focus.min(paths.len() - 1) + 1;
+        paths.insert(index, path);
+        index
+    };
+    publish_chain(paths, (focus, false), "ADDED", app, audio, models, midi);
 }
 
-fn load_path(path: &Path, app: &mut App, audio: &mut AudioClient, midi: &mut MidiController) {
-    match NamModel::load(path, crate::audio::SAMPLE_RATE, audio.period_frames()) {
-        Ok(model) => {
-            let metadata = model.metadata().clone();
-            if let Err(error) = audio.queue_model(model) {
-                app.set_status(error.to_string(), true);
-                return;
-            }
-            app.params.reset_for_model();
-            midi.arm_pickup(&app.params);
-            app.loaded = Some(metadata.clone());
-            app.set_status(format!("LOADED {}", metadata.name), false);
+fn remove_focused(
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &ModelDirectory,
+    midi: &mut MidiController,
+) {
+    if app.mic_focus {
+        app.set_status("MIC IS BAKED INTO CAB · DELETE CAB SLOT", false);
+        return;
+    }
+    if app.chain.is_empty() {
+        app.set_status("CHAIN IS ALREADY EMPTY", true);
+        return;
+    }
+    let mut paths = chain_paths(app);
+    paths.remove(app.chain_focus);
+    let focus = app.chain_focus.min(paths.len().saturating_sub(1));
+    publish_chain(paths, (focus, false), "REMOVED", app, audio, models, midi);
+}
+
+fn move_focused(
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &ModelDirectory,
+    midi: &mut MidiController,
+    direction: i8,
+) {
+    if app.mic_focus {
+        app.set_status("MIC MOVES WITH ITS CABINET", false);
+        return;
+    }
+    if app.chain.len() < 2 {
+        app.set_status("ADD ANOTHER SLOT BEFORE REORDERING", true);
+        return;
+    }
+    let target = if direction < 0 {
+        app.chain_focus.checked_sub(1)
+    } else {
+        let next = app.chain_focus + 1;
+        (next < app.chain.len()).then_some(next)
+    };
+    let Some(target) = target else {
+        app.set_status("SLOT IS ALREADY AT CHAIN EDGE", false);
+        return;
+    };
+    let mut paths = chain_paths(app);
+    paths.swap(app.chain_focus, target);
+    publish_chain(paths, (target, false), "MOVED", app, audio, models, midi);
+}
+
+fn reload_chain(
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &ModelDirectory,
+    midi: &mut MidiController,
+) {
+    if app.chain.is_empty() {
+        app.set_status("NO CHAIN TO RELOAD", true);
+        return;
+    }
+    publish_chain(
+        chain_paths(app),
+        (app.chain_focus, app.mic_focus),
+        "RELOADED",
+        app,
+        audio,
+        models,
+        midi,
+    );
+}
+
+fn focus_chain_relative(app: &mut App, direction: i8) {
+    if app.chain.is_empty() {
+        app.chain_focus = 0;
+        app.mic_focus = false;
+        return;
+    }
+    let targets = focus_targets(&app.chain);
+    let current = targets
+        .iter()
+        .position(|target| *target == (app.chain_focus, app.mic_focus))
+        .unwrap_or(0);
+    let next = relative_index(current, targets.len(), direction);
+    (app.chain_focus, app.mic_focus) = targets[next];
+}
+
+fn focus_targets(chain: &[ModelMetadata]) -> Vec<(usize, bool)> {
+    let mut targets = Vec::with_capacity(chain.len() * 2);
+    for (index, metadata) in chain.iter().enumerate() {
+        targets.push((index, false));
+        if is_cabinet_path(&metadata.path) {
+            targets.push((index, true));
         }
-        Err(error) => app.set_status(error.to_string(), true),
+    }
+    if targets.is_empty() {
+        targets.push((0, false));
+    }
+    targets
+}
+
+fn is_cabinet_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+}
+
+fn relative_index(current: usize, len: usize, direction: i8) -> usize {
+    debug_assert!(len > 0);
+    if direction < 0 {
+        current.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (current + 1) % len
+    }
+}
+
+fn browse_or_select_mic(
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &mut ModelDirectory,
+    midi: &mut MidiController,
+    direction: i8,
+) {
+    if app.mic_focus {
+        select_mic_variant(app, audio, models, midi, direction);
+    } else {
+        models.select_relative(direction);
+    }
+}
+
+fn select_mic_variant(
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &mut ModelDirectory,
+    _midi: &mut MidiController,
+    direction: i8,
+) {
+    let Some(active) = app.chain.get(app.chain_focus) else {
+        app.mic_focus = false;
+        return;
+    };
+    let Some(variants) = app.cabinet_variants.get(app.chain_focus) else {
+        app.set_status("CABINET PACK IS NOT LOADED", true);
+        return;
+    };
+    if variants.len() < 2 {
+        app.set_status("NO DOCUMENTED MIC VARIANTS FOR THIS CAB", false);
+        return;
+    }
+    let current = variants
+        .iter()
+        .position(|variant| variant.path == active.path)
+        .unwrap_or(0);
+    let next = relative_index(current, variants.len(), direction);
+    let selected = variants[next].clone();
+    if let Err(error) = audio.queue_cabinet_variant(app.chain_focus, next) {
+        app.set_status(error.to_string(), true);
+        return;
+    }
+    app.chain[app.chain_focus] = selected.clone();
+    models.select_path(&selected.path);
+    app.set_status("MIC VARIANT · LIVE SWITCH", false);
+}
+
+fn chain_paths(app: &App) -> Vec<PathBuf> {
+    app.chain
+        .iter()
+        .map(|metadata| metadata.path.clone())
+        .collect()
+}
+
+fn publish_chain(
+    paths: Vec<PathBuf>,
+    focus: (usize, bool),
+    verb: &str,
+    app: &mut App,
+    audio: &mut AudioClient,
+    models: &ModelDirectory,
+    midi: &mut MidiController,
+) -> bool {
+    let (focus, mic_focus) = focus;
+    let cabinet_variants = paths
+        .iter()
+        .map(|path| {
+            let variants = models.ir_variants(path);
+            if variants.is_empty() && is_cabinet_path(path) {
+                vec![path.clone()]
+            } else {
+                variants
+                    .into_iter()
+                    .map(|entry| entry.path.clone())
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    match NamChain::load_with_cabinet_variants(
+        &paths,
+        &cabinet_variants,
+        crate::audio::SAMPLE_RATE,
+        audio.period_frames(),
+    ) {
+        Ok(chain) => {
+            let metadata = chain.metadata();
+            let variant_metadata = chain.cabinet_variant_metadata();
+            if let Err(error) = audio.queue_chain(chain) {
+                app.set_status(error.to_string(), true);
+                return false;
+            }
+            midi.arm_pickup(&app.params);
+            app.chain = metadata;
+            app.cabinet_variants = variant_metadata;
+            app.chain_focus = focus.min(app.chain.len().saturating_sub(1));
+            app.mic_focus = mic_focus
+                && app
+                    .chain
+                    .get(app.chain_focus)
+                    .is_some_and(|metadata| is_cabinet_path(&metadata.path));
+            app.set_status(format!("{verb} · {} SLOT(S)", app.chain.len()), false);
+            true
+        }
+        Err(error) => {
+            app.set_status(error.to_string(), true);
+            false
+        }
     }
 }
 
@@ -384,7 +663,7 @@ fn draw(
     // Rows 1-12 are body-owned. Row 13 is cleared and replaced only by
     // draw_status(), matching shr-daw's shared working-screen contract.
     frame.render_widget(Clear, Rect::new(area.x, area.y, area.width, 12));
-    draw_model_header(frame, area, app.loaded.as_ref());
+    draw_chain_header(frame, area, app, models);
     let telemetry = app.telemetry.snapshot();
     draw_meter(
         frame,
@@ -403,58 +682,170 @@ fn draw(
     draw_selection(frame, row(area, 5), models);
     draw_parameters(frame, area, app);
     draw_midi(frame, row(area, 8), app, midi);
-    draw_hints(frame, area);
+    draw_chain_controls(frame, row(area, 9), app);
+    draw_hints(frame, area, app);
     draw_status(frame, row(area, 12), app, midi, telemetry, period, cpu);
     if app.help {
         draw_help(frame, area);
     }
 }
 
-fn draw_model_header(
+fn draw_chain_header(
     frame: &mut Frame<CrosstermBackend<Stdout>>,
     area: Rect,
-    metadata: Option<&ModelMetadata>,
+    app: &App,
+    models: &ModelDirectory,
 ) {
-    let Some(metadata) = metadata else {
-        draw_text(frame, row(area, 0), "MODEL --", Color::White);
+    let Some(metadata) = app.chain.get(app.chain_focus) else {
+        draw_text(
+            frame,
+            row(area, 0),
+            &format!("CHAIN 0/{MAX_CHAIN_MODELS} · EMPTY"),
+            Color::White,
+        );
         draw_text(
             frame,
             row(area, 1),
-            "SR 48000  FILE --  LOAD --",
+            "SLOT -- · SELECT A MODEL, THEN ADD",
             Color::Gray,
         );
         draw_text(frame, row(area, 2), "META --", Color::Gray);
         return;
     };
+    if app.mic_focus {
+        draw_mic_header(frame, area, app, metadata, models);
+        return;
+    }
+    let previous = app
+        .chain_focus
+        .checked_sub(1)
+        .and_then(|index| app.chain.get(index))
+        .map(|item| fit_cells(&item.name, 7))
+        .unwrap_or_else(|| "--".to_owned());
+    let next = if is_cabinet_path(&metadata.path) {
+        "MIC*".to_owned()
+    } else {
+        app.chain
+            .get(app.chain_focus + 1)
+            .map(|item| fit_cells(&item.name, 7))
+            .unwrap_or_else(|| "--".to_owned())
+    };
     draw_text(
         frame,
         row(area, 0),
-        &format!("MODEL {} [{}]", metadata.name, metadata.architecture),
+        &format!(
+            "CHAIN {}/{} <{} [{}] {}>",
+            app.chain_focus + 1,
+            app.chain.len(),
+            previous,
+            fit_cells(&metadata.name, 9),
+            next
+        ),
         Color::White,
     );
-    draw_text(
-        frame,
-        row(area, 1),
-        &format!(
-            "SR {} FILE {} LOAD {}",
-            metadata.expected_sample_rate.unwrap_or(48_000),
-            human_bytes(metadata.file_bytes),
-            metadata.loaded_at_utc
-        ),
-        Color::Gray,
-    );
-    draw_text(
-        frame,
-        row(area, 2),
-        &format!(
-            "META IN {} OUT {} {}W v{}",
-            level_text(metadata.input_level_dbu),
-            level_text(metadata.output_level_dbu),
-            metadata.weight_count,
-            metadata.version
-        ),
-        Color::Gray,
-    );
+    if let Some(profile) = models.ir_profile(&metadata.path) {
+        draw_text(
+            frame,
+            row(area, 1),
+            &format!("CAB {} · SPK {}", profile.cabinet, profile.speaker),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 2),
+            &format!("MIC {} · VOICE {} >", profile.microphone, profile.variant),
+            Color::Gray,
+        );
+    } else {
+        draw_text(
+            frame,
+            row(area, 1),
+            &format!(
+                "SLOT {} {} [{}]",
+                app.chain_focus + 1,
+                metadata.name,
+                metadata.architecture
+            ),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 2),
+            &format!(
+                "v{} SR{} {} {} IN{} OUT{}",
+                metadata.version,
+                metadata.expected_sample_rate.unwrap_or(48_000),
+                human_bytes(metadata.file_bytes),
+                metadata.detail,
+                level_text(metadata.input_level_dbu),
+                level_text(metadata.output_level_dbu)
+            ),
+            Color::Gray,
+        );
+    }
+}
+
+fn draw_mic_header(
+    frame: &mut Frame<CrosstermBackend<Stdout>>,
+    area: Rect,
+    app: &App,
+    metadata: &ModelMetadata,
+    models: &ModelDirectory,
+) {
+    let variants = app
+        .cabinet_variants
+        .get(app.chain_focus)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let selected = variants
+        .iter()
+        .position(|variant| variant.path == metadata.path)
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    if let Some(profile) = models.ir_profile(&metadata.path) {
+        draw_text(
+            frame,
+            row(area, 0),
+            &format!(
+                "MIC* {}/{} · {}",
+                selected,
+                variants.len().max(1),
+                profile.cabinet
+            ),
+            Color::White,
+        );
+        draw_text(
+            frame,
+            row(area, 1),
+            &format!("MIC {} · POS {}", profile.microphone, profile.position),
+            Color::LightYellow,
+        );
+        draw_text(
+            frame,
+            row(area, 2),
+            &format!("VOICE {} · BAKED INTO CAB IR", profile.variant),
+            Color::Gray,
+        );
+    } else {
+        draw_text(
+            frame,
+            row(area, 0),
+            "MIC* 1/1 · USER CABINET IR",
+            Color::White,
+        );
+        draw_text(
+            frame,
+            row(area, 1),
+            "MIC UNKNOWN · POSITION UNKNOWN",
+            Color::LightYellow,
+        );
+        draw_text(
+            frame,
+            row(area, 2),
+            "BAKED INTO IR · ADD PACK METADATA",
+            Color::Gray,
+        );
+    }
 }
 
 fn draw_meter(
@@ -576,14 +967,34 @@ fn draw_midi(
     );
 }
 
-fn draw_hints(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect) {
-    draw_halves(frame, row(area, 10), "[UP/DN +/-] SELECT", "[ENTER] LOAD");
-    draw_halves(
+fn draw_hints(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect, app: &App) {
+    draw_text(
         frame,
-        row(area, 11),
-        "[I/O] GAIN [B] BYP",
-        "[M] LEARN [?] HELP",
+        row(area, 10),
+        "PEDAL > AMP > CAB > MIC* (VIRTUAL)",
+        Color::White,
     );
+    if app.mic_focus {
+        draw_halves(frame, row(area, 11), "UP/DN MIC VOICE", "LEFT CAB · ? HELP");
+    } else {
+        draw_halves(frame, row(area, 11), "UP/DN BROWSE", "ENTER LOAD · ? HELP");
+    }
+}
+
+fn draw_chain_controls(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect, app: &App) {
+    let labels = if app.mic_focus {
+        ["< CAB", "▲ MIC", "▼ MIC", "NEXT >"]
+    } else {
+        ["< SLOT", "+ ADD", "- DEL", "SLOT >"]
+    };
+    for (index, label) in labels.into_iter().enumerate() {
+        frame.render_widget(
+            Paragraph::new(label)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::White)),
+            Rect::new(area.x + index as u16 * 10, area.y, 10, 1),
+        );
+    }
 }
 
 fn draw_status(
@@ -618,11 +1029,14 @@ fn draw_status(
             },
         )
     } else {
-        let model = app
-            .loaded
-            .as_ref()
-            .map(|metadata| fit_cells(&metadata.name, 8))
-            .unwrap_or_else(|| "--".to_owned());
+        let model = if app.mic_focus {
+            "MIC*".to_owned()
+        } else {
+            app.chain
+                .get(app.chain_focus)
+                .map(|metadata| fit_cells(&metadata.name, 7))
+                .unwrap_or_else(|| "--".to_owned())
+        };
         let midi = fit_cells(midi.device_label(), 6);
         let temperature = app
             .temperature_c
@@ -630,8 +1044,8 @@ fn draw_status(
             .unwrap_or_else(|| "T--C".to_owned());
         (
             format!(
-                "{model} X{} P{period} M:{midi} C{cpu:.0}% {temperature}",
-                telemetry.xruns
+                "S{} {model} X{} P{period} M:{midi} C{cpu:.0}% {temperature}",
+                telemetry.chain_len, telemetry.xruns
             ),
             Color::Gray,
         )
@@ -653,14 +1067,15 @@ fn draw_status(
 }
 
 fn draw_help(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect) {
-    let popup = Rect::new(area.x + 1, area.y + 1, 38, 8);
+    let popup = Rect::new(area.x + 1, area.y + 1, 38, 9);
     frame.render_widget(Clear, popup);
     let help = [
-        "UP/DOWN or +/-  choose model",
-        "ENTER load · R reload · B bypass",
+        "UP/DOWN browse · LEFT/RIGHT stage",
+        "On MIC*: UP/DOWN changes cab IR",
+        "A add · ENTER replace · D delete",
+        "[ / ] move slot · R reload chain",
         "I/O +0.5 dB · Shift I/O +3 dB",
-        "Tap a control; drag gains vertically",
-        "M learns next positional CC",
+        "MIC* is virtual; one cabinet DSP slot",
         "Q or ESC quits · ? closes help",
     ]
     .join("\n");
@@ -776,4 +1191,43 @@ fn fit_cells(text: &str, cells: usize) -> String {
         used += width;
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata(path: &str) -> ModelMetadata {
+        ModelMetadata {
+            path: PathBuf::from(path),
+            name: path.to_owned(),
+            architecture: String::new(),
+            version: String::new(),
+            file_bytes: 0,
+            detail: String::new(),
+            expected_sample_rate: None,
+            input_level_dbu: None,
+            output_level_dbu: None,
+        }
+    }
+
+    #[test]
+    fn cabinet_adds_one_virtual_microphone_focus_target() {
+        let chain = [
+            metadata("pedal.nam"),
+            metadata("cab.wav"),
+            metadata("delay.nam"),
+        ];
+        assert_eq!(
+            focus_targets(&chain),
+            vec![(0, false), (1, false), (1, true), (2, false)]
+        );
+    }
+
+    #[test]
+    fn virtual_selector_wraps_both_directions() {
+        assert_eq!(relative_index(0, 3, -1), 2);
+        assert_eq!(relative_index(2, 3, 1), 0);
+        assert_eq!(relative_index(1, 3, 1), 2);
+    }
 }

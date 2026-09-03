@@ -1,6 +1,9 @@
 mod audio;
+mod cab;
+mod catalog;
 mod midi;
 mod model_dir;
+mod model_manager;
 mod nam;
 mod params;
 mod tui;
@@ -13,6 +16,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 fn main() -> Result<()> {
+    if model_manager::run_if_requested()? {
+        return Ok(());
+    }
     let Some(options) = Options::parse()? else {
         return Ok(());
     };
@@ -51,7 +57,7 @@ struct Options {
 impl Options {
     fn parse() -> Result<Option<Self>> {
         let mut options = Self {
-            models_dir: PathBuf::from("models"),
+            models_dir: model_dir::default_path(),
             controller_config: PathBuf::from("controller.conf"),
             midi_input: None,
             client_name: "rpi-tone-over-9000".to_owned(),
@@ -130,14 +136,18 @@ fn print_help() {
         "rpi-tone-over-9000\n\
          \n\
          Usage: rpi-tone-over-9000 [OPTIONS]\n\
+                rpi-tone-over-9000 models COMMAND [OPTIONS]\n\
          \n\
-           --models-dir DIR         NAM directory (default: ./models)\n\
+           --models-dir DIR         NAM/IR directory (default: user data directory)\n\
            --controller-config FILE shr-daw-shaped mapping (default: controller.conf)\n\
            --midi NAME              exact stable ALSA MIDI input identity\n\
            --client-name NAME       JACK client name\n\
            --capture-port PORT      mono source (default: system:capture_1)\n\
            --playback-port PORT     mono destination (default: system:playback_1)\n\
            --period 128|256         require this JACK period (default: 256)\n\
-           -h, --help               show this help"
+           -h, --help               show this help\n\
+         \n\
+         Run `rpi-tone-over-9000 models help` for catalog, download,\n\
+         verification, import, and online browse commands."
     );
 }

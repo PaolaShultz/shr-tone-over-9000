@@ -42,6 +42,8 @@ fn main() {
     build
         .cpp(true)
         .std("c++17")
+        .flag("-include")
+        .flag("src/eigen_compat.h")
         .define("NAM_SAMPLE_FLOAT", None)
         .define("NAM_ENABLE_A2_FAST", None)
         .define("NAM_DEFAULT_MAX_BUFFER_SIZE", Some("256"))
@@ -70,6 +72,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=stdc++fs");
 
     println!("cargo:rerun-if-changed=src/nam_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/eigen_compat.h");
     for source in sources {
         rerun_if_changed(&nam.join(source));
     }

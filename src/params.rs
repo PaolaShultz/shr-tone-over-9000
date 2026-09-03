@@ -54,12 +54,6 @@ impl Parameters {
         }
     }
 
-    pub fn reset_for_model(&self) {
-        self.input_gain_db.store(0.0);
-        self.output_gain_db.store(0.0);
-        self.bypass.store(false, Ordering::Relaxed);
-    }
-
     pub fn adjust_db(&self, parameter: ParamId, delta_db: f32) {
         let target = match parameter {
             ParamId::InputGain => &self.input_gain_db,
