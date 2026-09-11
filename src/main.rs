@@ -1,9 +1,12 @@
 mod audio;
 mod cab;
 mod catalog;
+mod hub;
 mod midi;
 mod model_dir;
 mod model_manager;
+mod model_provenance;
+mod model_search;
 mod nam;
 mod params;
 mod tui;
@@ -51,11 +54,15 @@ struct Options {
     client_name: String,
     capture_port: String,
     playback_port: String,
-    period: u32,
+    period: Option<u32>,
 }
 
 impl Options {
     fn parse() -> Result<Option<Self>> {
+        Self::parse_from(env::args_os().skip(1))
+    }
+
+    fn parse_from(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Option<Self>> {
         let mut options = Self {
             models_dir: model_dir::default_path(),
             controller_config: PathBuf::from("controller.conf"),
@@ -63,9 +70,9 @@ impl Options {
             client_name: "rpi-tone-over-9000".to_owned(),
             capture_port: "system:capture_1".to_owned(),
             playback_port: "system:playback_1".to_owned(),
-            period: 256,
+            period: None,
         };
-        let mut arguments = env::args_os().skip(1);
+        let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             let argument = argument.to_string_lossy();
             match argument.as_ref() {
@@ -98,12 +105,13 @@ impl Options {
                 }
                 "--period" => {
                     let value = next_string(&mut arguments, "--period")?;
-                    options.period = value
+                    let period = value
                         .parse::<u32>()
                         .with_context(|| format!("invalid --period {value:?}"))?;
-                    if !matches!(options.period, 128 | 256) {
+                    if !matches!(period, 128 | 256) {
                         bail!("--period must be 128 or 256 frames");
                     }
+                    options.period = Some(period);
                 }
                 _ => bail!("unknown argument {argument:?}; use --help"),
             }
@@ -144,10 +152,34 @@ fn print_help() {
            --client-name NAME       JACK client name\n\
            --capture-port PORT      mono source (default: system:capture_1)\n\
            --playback-port PORT     mono destination (default: system:playback_1)\n\
-           --period 128|256         require this JACK period (default: 256)\n\
+           --period 128|256         require this JACK period (default: detect live JACK)\n\
            -h, --help               show this help\n\
          \n\
          Run `rpi-tone-over-9000 models help` for catalog, download,\n\
          verification, import, and online browse commands."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Options;
+    use std::ffi::OsString;
+
+    #[test]
+    fn no_arguments_auto_detects_live_jack_period() {
+        let options = Options::parse_from(Vec::<OsString>::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(options.period, None);
+    }
+
+    #[test]
+    fn explicit_period_remains_a_strict_override() {
+        let options = Options::parse_from(["--period", "128"].map(OsString::from))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(options.period, Some(128));
+    }
 }

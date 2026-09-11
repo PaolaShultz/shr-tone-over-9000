@@ -86,7 +86,7 @@ pub struct AudioClient {
 impl AudioClient {
     pub fn start(
         client_name: &str,
-        expected_period: u32,
+        requested_period: Option<u32>,
         capture_port: String,
         playback_port: String,
         params: Arc<Parameters>,
@@ -103,12 +103,16 @@ impl AudioClient {
                 SAMPLE_RATE
             );
         }
-        if client.buffer_size() != expected_period {
-            bail!(
-                "JACK period is {} frames; requested {} (configure JACK before launch)",
-                client.buffer_size(),
-                expected_period
-            );
+        let period = client.buffer_size();
+        if !matches!(period, 128 | 256) {
+            bail!("JACK period is {period} frames; supported periods are 128 and 256");
+        }
+        if let Some(requested_period) = requested_period {
+            if period != requested_period {
+                bail!(
+                    "JACK period is {period} frames; requested {requested_period} (configure JACK before launch or omit --period to detect it automatically)"
+                );
+            }
         }
 
         let input = client
@@ -129,8 +133,8 @@ impl AudioClient {
         let process = AudioProcess {
             input,
             output,
-            scratch: vec![0.0; expected_period as usize],
-            expected_period,
+            scratch: vec![0.0; period as usize],
+            expected_period: period,
             params,
             telemetry: Arc::clone(&inner),
             command_rx,
@@ -170,7 +174,7 @@ impl AudioClient {
             command_tx,
             retired_rx,
             telemetry,
-            period_frames: expected_period,
+            period_frames: period,
             input_port_name,
             output_port_name,
             capture_port,

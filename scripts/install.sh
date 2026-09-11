@@ -8,6 +8,8 @@ models_dir="${RPI_TONE_MODELS_DIR:-${XDG_DATA_HOME:-${account_home}/.local/share
 accept_t3k=false
 install_models=true
 system_deps=false
+tone3000_client_id=""
+hub_config="${RPI_TONE_HUB_CONFIG:-${XDG_CONFIG_HOME:-${account_home}/.config}/rpi-tone-over-9000/hub.conf}"
 
 usage() {
     printf '%s\n' \
@@ -16,6 +18,7 @@ usage() {
         "  --accept-t3k       install the curated TONE3000 NAM files for local use" \
         "  --no-models        install only the application" \
         "  --system-deps      install Debian build/runtime packages with sudo" \
+        "  --tone3000-client-id ID  configure this installation's t3k_pub_… ID" \
         "  --prefix DIR       binary prefix (default: ${install_prefix})" \
         "  --models-dir DIR   model/IR library (default: ${models_dir})" \
         "  -h, --help         show this help"
@@ -26,6 +29,11 @@ while (($#)); do
         --accept-t3k) accept_t3k=true ;;
         --no-models) install_models=false ;;
         --system-deps) system_deps=true ;;
+        --tone3000-client-id)
+            [[ $# -ge 2 ]] || { printf '%s\n' '--tone3000-client-id requires an ID' >&2; exit 2; }
+            tone3000_client_id="$2"
+            shift
+            ;;
         --prefix)
             [[ $# -ge 2 ]] || { printf '%s\n' '--prefix requires a directory' >&2; exit 2; }
             install_prefix="$2"
@@ -41,6 +49,11 @@ while (($#)); do
     esac
     shift
 done
+
+if [[ -n "$tone3000_client_id" && ! "$tone3000_client_id" =~ ^t3k_pub_[^[:space:]]+$ ]]; then
+    printf '%s\n' '--tone3000-client-id must have the form t3k_pub_…' >&2
+    exit 2
+fi
 
 cd "$repo_dir"
 
@@ -72,6 +85,12 @@ fi
 cargo build --manifest-path "${repo_dir}/Cargo.toml" --release --locked
 install -Dm755 "${repo_dir}/target/release/rpi-tone-over-9000" \
     "${install_prefix}/bin/rpi-tone-over-9000"
+
+if [[ -n "$tone3000_client_id" ]]; then
+    install -d -m700 "$(dirname "$hub_config")"
+    printf 'client_id=%s\n' "$tone3000_client_id" | install -m600 /dev/stdin "$hub_config"
+    printf 'TONE3000 client config: %s\n' "$hub_config"
+fi
 
 if "$install_models"; then
     if "$accept_t3k"; then

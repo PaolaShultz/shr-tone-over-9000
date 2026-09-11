@@ -7,10 +7,12 @@ processes `system:capture_1` to `system:playback_1` at 48 kHz. The normal chain
 is **pedal NAM → amp-head NAM → cabinet IR**.
 
 It is not a DAW, plugin host, LV2/CLAP wrapper, preset manager, GUI, or WebView.
-It does include a small command-line model manager with a pinned, checksummed
-starter catalog, safe local/URL import, verification, and links into the
-official TONE3000 browser. It does not embed a tone3000.com login. V1 is mono,
-has no EQ, and keeps oversampling off.
+It includes a pinned, checksummed starter catalog, safe local/URL import,
+verification, and TONE3000 metadata search with exact one-model downloads. The
+smart hub flow is available directly in the TUI; its CLI commands remain useful
+for setup and scripting. TONE3000 authentication happens in the user's browser
+or phone through OAuth/PKCE; credentials never enter the audio thread. V1 is
+mono, has no EQ, and keeps oversampling off.
 
 ## Raspberry Pi 5 build
 
@@ -65,22 +67,28 @@ order.
 Use a USB Audio Class-compliant guitar interface. This program never starts,
 stops, restarts, or reconfigures JACK; it opens with `NO_START_SERVER` and
 attaches only to the requested ports. Start the already-owned JACK service at
-48 kHz, 256 frames, and three periods, then run:
+48 kHz, either 128 or 256 frames, and three periods, then run:
 
 ```sh
 target/debug/rpi-tone-over-9000
 ```
 
-For a JACK server already configured at 128 frames:
+The app detects the live JACK period automatically. To require a particular
+period in a script or diagnostic check, pass it explicitly:
 
 ```sh
 target/debug/rpi-tone-over-9000 --period 128
 ```
 
-`--period` validates JACK's live period. It does not seize server ownership or
-change timing during a session. Override unusual exact routes with
-`--capture-port` and `--playback-port`; defaults are
+`--period` is optional and validates JACK's live period when supplied. It does
+not seize server ownership or change timing during a session. Override unusual
+exact routes with `--capture-port` and `--playback-port`; defaults are
 `system:capture_1` and `system:playback_1`.
+
+With JACK2, put the global `--sync` option before `-d alsa`. Its default
+asynchronous graph mode adds one period between this client's processed output
+and the ALSA playback cycle. At 48 kHz/128 frames, synchronous mode therefore
+reports 128 capture plus 128 playback frames rather than 128 plus 256.
 
 Follow `../shr-daw/scripts/setup.sh` and
 `../shr-daw/docs/INSTALLATION.md` for JACK ownership, the audio-group
@@ -112,11 +120,9 @@ rpi-tone-over-9000 models verify all
 rpi-tone-over-9000 models browse cab
 ```
 
-`models browse pedal|amp|cab|rig` opens the filtered official TONE3000 search
-when a desktop browser is available and always prints the URL. TONE3000's full
-in-app API flow requires a registered OAuth client and redirect URI, so the app
-does not pretend to have account access. Download a chosen `.nam` or `.wav`
-asset from its source, then add it safely:
+`models browse pedal|amp|cab|rig` opens the filtered official TONE3000 website
+when a desktop browser is available and always prints the URL. Download a
+chosen `.nam` or `.wav` asset manually, then add it safely:
 
 ```sh
 rpi-tone-over-9000 models import ~/Downloads/my-amp.nam
@@ -128,6 +134,118 @@ Imports and downloads are staged outside the watched directory, checksummed
 when a digest is available, fully decoded, and test-loaded before an atomic
 rename. Existing files are preserved unless `--replace` is explicit. A bad
 download therefore cannot replace the active library or sounding chain.
+
+### Smart TONE3000 search
+
+The normal on-device flow needs no hub commands:
+
+1. Press `h` from the amp screen.
+2. On first use, confirm the installation's TONE3000 publishable client ID and
+   press Enter.
+3. Scan the QR shown directly in the terminal with a phone on the Pi's current
+   Wi-Fi and approve the login. The authorization URL stays internal; the only
+   alternate action on this screen is Esc to cancel.
+4. Type or paste a query such as
+   `marshall jcm with bass 3-4 mid 6+ high 2-3`, then press Enter.
+5. Use Up/Down for exact model results, Enter for all available metadata and
+   evidence, and Left/Right for another bounded result page.
+6. Press `d` to download only the highlighted model. After validation, the amp
+   screen returns with that file selected; press Enter separately to load it.
+
+Search, authentication, and download run outside the TUI/audio event loop, so
+meters and the sounding chain remain live. Esc cancels OAuth immediately and a
+search after its current HTTP request; input is retained for retry. A started
+model download finishes its staged validation and atomic publish rather than
+leaving a partial library entry. Pressing `d` for an already-installed hub
+model simply selects the existing file.
+
+The TUI automatically proposes
+`http://CURRENT_PRIVATE_WIFI_IP:43900/callback`. Register that exact URI in the
+TONE3000 client before authorizing; if the Pi gets a different address on
+another Wi-Fi, update the allowed redirect. `TONE3000_REDIRECT_URI` can pin an
+explicit registered private-LAN callback. During the five-minute login window,
+the QR points to a short local URL on the Pi; that listener redirects the phone
+to TONE3000 and then accepts only the registered callback path.
+
+The publishable client ID is installation configuration, never a compiled
+default. Set it while installing:
+
+```sh
+scripts/install.sh --tone3000-client-id t3k_pub_YOUR_KEY
+```
+
+This writes owner-only
+`$XDG_CONFIG_HOME/rpi-tone-over-9000/hub.conf`, falling back to
+`$HOME/.config/rpi-tone-over-9000/hub.conf`. Another installation supplies its
+own ID. `TONE3000_CLIENT_ID` and `RPI_TONE_HUB_CONFIG` remain deployment
+overrides. Never put the TONE3000 secret key on this device.
+
+The equivalent CLI flow is retained below.
+
+Create a TONE3000 publishable API key and register the callback URI in its
+allowed redirects. Connect once; the default callback is suitable when the
+browser runs on the same machine:
+
+```sh
+rpi-tone-over-9000 models hub connect --client-id t3k_pub_YOUR_KEY
+```
+
+On a headless Pi, use its private LAN address. The CLI prints only the short
+Pi-local handoff URL, which must be opened on a phone connected to the same LAN:
+
+```sh
+rpi-tone-over-9000 models hub connect --client-id t3k_pub_YOUR_KEY \
+  --redirect-uri http://192.168.1.50:43900/callback
+```
+
+Credentials are stored at
+`$XDG_CONFIG_HOME/rpi-tone-over-9000/tone3000-auth.json`, falling back to
+`$HOME/.config/rpi-tone-over-9000/tone3000-auth.json`, with mode 0600. Override
+the location with `RPI_TONE_HUB_AUTH` or `--auth-file`. The secret TONE3000 key
+is server-only and must never be supplied to this application.
+
+Search amp and capture settings using one query. `high`/`highs` is normalized
+to `treble`, and `middle`/`mids` to `mid`:
+
+```sh
+rpi-tone-over-9000 models hub search \
+  "marshall jcm with bass on 3-4 and mid on 6+ and high on 2-3"
+```
+
+The command first prints its parsed make/model and numeric constraints. It then
+searches tone metadata, reads the model names and explicitly model-associated
+description lines inside the returned tones, and prints only models whose
+documented settings satisfy every constraint. Supported syntax is `bass 4`,
+`bass 3-4`, `mid 6+`, `gain >=6`, and `treble <=3`; numeric filters use a 0–10
+control scale. Settings are not guessed. An unknown setting does not match a
+constrained field, and zero exact matches remains zero rather than silently
+broadening the query.
+
+These values are search metadata only. They do not create runtime amp controls,
+interpolate between captures, switch a capture pack, or download unselected
+models.
+
+Results are model-scoped handles. Inspect and download exactly one:
+
+```sh
+rpi-tone-over-9000 models hub show t3k:model:88421
+rpi-tone-over-9000 models hub download t3k:model:88421
+```
+
+Search and show retrieve JSON metadata only. Only `hub download` fetches binary
+model data, and it accepts exactly one `t3k:model:ID`, never a tone/pack ID. The
+download is limited to 100 MiB, staged, test-loaded, hashed, and atomically
+installed. Its TONE3000 identity, creator, license, source, parsed settings,
+evidence, and SHA-256 are recorded in
+`.rpi-tone-over-9000-models.json` beside the models. Use `--name FILE.nam` to
+choose a local filename or `--replace` to replace an existing one explicitly.
+
+The hub defaults to NAM architecture 2. Pass `--architecture 1` or
+`--architecture custom` only when that architecture is supported by the pinned
+NAM core. Use `--page N` to request another bounded page. TONE3000 heavily
+rate-limits custom search and may require integration approval; the application
+does not scrape the website or bypass API terms. See the current
+[TONE3000 API documentation](https://www.tone3000.com/api).
 
 For an IR pack with documented microphone captures, record the pack identity
 while importing each WAV. Files with the same `--cab-id` become variants of one
@@ -171,6 +289,7 @@ mono. Convolution setup and allocation happen off the audio thread.
 - `i` / `o`: raise input/output gain by 0.5 dB; Shift uses 3 dB
 - `b`: toggle the whole-chain bypass
 - `m`: learn the next positional CC for the focused control
+- `h`: open smart hub connect/search/details/download
 - `?`: help; `q` or Esc: clean exit
 
 Tap the model row to replace the focused slot. The dedicated chain-control row
@@ -183,6 +302,29 @@ The final row is owned only by the shared status renderer: a steady white `■`,
 one space, then model, xrun count, JACK period, MIDI device, JACK CPU estimate,
 and thermal temperature. Faults temporarily replace that text. The two rows
 above it are controller hints; there are no stacked gray status rows.
+
+## Moving the Pi to another Wi-Fi
+
+This Debian/Raspberry Pi setup uses NetworkManager. The easiest terminal UI is:
+
+```sh
+sudo nmtui
+```
+
+Choose **Activate a connection**, select the friend's network, enter its
+password, and quit. The direct command is also short and prompts securely for
+the password instead of putting it in shell history:
+
+```sh
+nmcli device wifi list
+sudo nmcli --ask device wifi connect "FRIEND SSID" ifname wlan0
+```
+
+Changing the active Wi-Fi disconnects an SSH session carried by the old
+network, so do this from the Pi's own keyboard/display or expect to reconnect at
+its new address. Check it with `ip -brief address show wlan0`. If TONE3000 OAuth
+uses a phone, put the phone on the same Wi-Fi and allow the newly displayed Pi
+callback URI in the TONE3000 client.
 
 ## MiniLab / ALSA MIDI
 

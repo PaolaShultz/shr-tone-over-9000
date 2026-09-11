@@ -1,4 +1,5 @@
 use crate::audio::{AudioClient, AudioTelemetry, TelemetrySnapshot};
+use crate::hub::{self, HubSearchPage};
 use crate::midi::{MidiAction, MidiController};
 use crate::model_dir::ModelDirectory;
 use crate::nam::{ModelMetadata, NamChain};
@@ -12,17 +13,21 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use qrcode::types::Color as QrColor;
+use qrcode::{EcLevel, QrCode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Span, Spans};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::fs;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
@@ -31,6 +36,7 @@ const HEIGHT: u16 = 13;
 const TICK: Duration = Duration::from_millis(33);
 const STATUS_LIFETIME: Duration = Duration::from_secs(3);
 const MAX_CHAIN_MODELS: usize = 4;
+const MAX_HUB_INPUT_BYTES: usize = 512;
 
 pub fn run(
     audio: &mut AudioClient,
@@ -92,6 +98,7 @@ fn run_loop(
 
     while !shutdown.load(Ordering::Relaxed) && !app.quit {
         audio.drain_retired();
+        poll_hub(&mut app, models);
         if let Err(error) = models.poll_watch() {
             app.set_status(error.to_string(), true);
         }
@@ -99,7 +106,11 @@ fn run_loop(
             app.set_status(warning, true);
         }
         while let Some(action) = midi.next_action(&app.params) {
-            handle_midi(action, &mut app, audio, models, midi);
+            if app.hub.is_open() {
+                handle_hub_midi(action, &mut app);
+            } else {
+                handle_midi(action, &mut app, audio, models, midi);
+            }
         }
         app.refresh_temperature();
 
@@ -116,8 +127,13 @@ fn run_loop(
             match event::read().context("read terminal input")? {
                 Event::Key(key) => handle_key(key, &mut app, audio, models, midi),
                 Event::Mouse(mouse) => handle_mouse(mouse, &mut app, audio, models, midi),
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::Paste(text) => handle_paste(&mut app, &text),
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
             }
+        }
+        if let Some(text) = app.external_text.take() {
+            show_external_text(terminal, &text)?;
+            last_draw = Instant::now() - TICK;
         }
     }
     Ok(())
@@ -137,6 +153,8 @@ struct App {
     temperature_c: Option<f32>,
     temperature_read: Instant,
     drag: Option<DragState>,
+    hub: HubUi,
+    external_text: Option<String>,
 }
 
 struct StatusMessage {
@@ -148,6 +166,150 @@ struct StatusMessage {
 struct DragState {
     parameter: ParamId,
     previous_row: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HubScreen {
+    Closed,
+    ClientId,
+    Connecting,
+    Query,
+    Searching,
+    Results,
+    Detail,
+    Downloading,
+}
+
+struct HubUi {
+    screen: HubScreen,
+    input: TextInput,
+    query: String,
+    architecture: String,
+    results: Option<HubSearchPage>,
+    selected: usize,
+    authorization_qr: Option<Vec<String>>,
+    error: Option<String>,
+    operation_id: u64,
+    cancelled: Arc<AtomicBool>,
+    events: Receiver<HubEvent>,
+    event_sender: Sender<HubEvent>,
+}
+
+enum HubEvent {
+    AuthorizationReady {
+        operation_id: u64,
+        qr: Result<Vec<String>, String>,
+    },
+    Connected(u64, Result<(), String>),
+    SearchFinished(u64, Result<HubSearchPage, String>),
+    DownloadFinished(u64, Result<PathBuf, String>),
+}
+
+impl HubEvent {
+    fn operation_id(&self) -> u64 {
+        match self {
+            Self::AuthorizationReady { operation_id, .. }
+            | Self::Connected(operation_id, _)
+            | Self::SearchFinished(operation_id, _)
+            | Self::DownloadFinished(operation_id, _) => *operation_id,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TextInput {
+    value: String,
+    cursor: usize,
+}
+
+impl TextInput {
+    fn set(&mut self, value: String) {
+        self.value = value;
+        self.cursor = self.value.len();
+    }
+
+    fn insert(&mut self, text: &str) {
+        let room = MAX_HUB_INPUT_BYTES.saturating_sub(self.value.len());
+        let mut accepted = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
+        while accepted.len() > room {
+            accepted.pop();
+        }
+        self.value.insert_str(self.cursor, &accepted);
+        self.cursor += accepted.len();
+    }
+
+    fn backspace(&mut self) {
+        if let Some((previous, _)) = self.value[..self.cursor].char_indices().next_back() {
+            self.value.drain(previous..self.cursor);
+            self.cursor = previous;
+        }
+    }
+
+    fn delete(&mut self) {
+        if let Some(character) = self.value[self.cursor..].chars().next() {
+            self.value
+                .drain(self.cursor..self.cursor + character.len_utf8());
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some((previous, _)) = self.value[..self.cursor].char_indices().next_back() {
+            self.cursor = previous;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(character) = self.value[self.cursor..].chars().next() {
+            self.cursor += character.len_utf8();
+        }
+    }
+}
+
+impl HubUi {
+    fn new() -> Self {
+        let (event_sender, events) = mpsc::channel();
+        Self {
+            screen: HubScreen::Closed,
+            input: TextInput::default(),
+            query: String::new(),
+            architecture: "2".to_owned(),
+            results: None,
+            selected: 0,
+            authorization_qr: None,
+            error: None,
+            operation_id: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events,
+            event_sender,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.screen != HubScreen::Closed
+    }
+
+    fn selected_item(&self) -> Option<&hub::HubSearchItem> {
+        self.results.as_ref()?.items.get(self.selected)
+    }
+
+    fn select_relative(&mut self, direction: i8) {
+        let Some(results) = &self.results else {
+            return;
+        };
+        if results.items.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = relative_index(self.selected, results.items.len(), direction);
+        }
+    }
+
+    fn begin_operation(&mut self) -> u64 {
+        self.operation_id = self.operation_id.wrapping_add(1);
+        self.operation_id
+    }
 }
 
 impl App {
@@ -166,6 +328,8 @@ impl App {
             temperature_c: None,
             temperature_read: Instant::now() - Duration::from_secs(2),
             drag: None,
+            hub: HubUi::new(),
+            external_text: None,
         }
     }
 
@@ -205,9 +369,14 @@ fn handle_key(
         }
         return;
     }
+    if app.hub.is_open() {
+        handle_hub_key(key, app, models);
+        return;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.help = true,
+        KeyCode::Char('h' | 'H') => open_hub(app),
         KeyCode::Up | KeyCode::Char('-') => browse_or_select_mic(app, audio, models, midi, -1),
         KeyCode::Down | KeyCode::Char('+') => browse_or_select_mic(app, audio, models, midi, 1),
         KeyCode::Left => focus_chain_relative(app, -1),
@@ -254,6 +423,362 @@ fn gain_step(modifiers: KeyModifiers) -> f32 {
     }
 }
 
+fn open_hub(app: &mut App) {
+    match hub::is_connected() {
+        Ok(true) => {
+            app.hub.error = None;
+            app.hub.screen = HubScreen::Query;
+            app.hub.input.set(app.hub.query.clone());
+            app.set_status("HUB · TYPE AN EXACT METADATA SEARCH", false);
+        }
+        Ok(false) => match hub::configured_client_id() {
+            Ok(client_id) => {
+                app.hub.error = None;
+                app.hub.screen = HubScreen::ClientId;
+                app.hub.input.set(client_id);
+                app.set_status("HUB FIRST USE · CONNECT TONE3000", false);
+            }
+            Err(error) => app.set_status(format!("HUB CONFIG · {error}"), true),
+        },
+        Err(error) => app.set_status(format!("HUB CREDENTIALS · {error}"), true),
+    }
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    if matches!(app.hub.screen, HubScreen::ClientId | HubScreen::Query) {
+        app.hub.input.insert(text);
+    }
+}
+
+fn handle_hub_key(key: KeyEvent, app: &mut App, models: &mut ModelDirectory) {
+    match app.hub.screen {
+        HubScreen::Closed => {}
+        HubScreen::ClientId => match key.code {
+            KeyCode::Esc => app.hub.screen = HubScreen::Closed,
+            KeyCode::Enter => start_hub_connect(app),
+            _ => {
+                app.hub.error = None;
+                edit_hub_input(key, &mut app.hub.input);
+            }
+        },
+        HubScreen::Connecting => {
+            if key.code == KeyCode::Esc {
+                app.hub.cancelled.store(true, Ordering::Relaxed);
+                app.hub.begin_operation();
+                app.hub.screen = HubScreen::ClientId;
+                app.set_status("TONE3000 CONNECTION CANCELLED", false);
+            }
+        }
+        HubScreen::Query => match key.code {
+            KeyCode::Esc => app.hub.screen = HubScreen::Closed,
+            KeyCode::Enter => start_hub_search(app, 1),
+            KeyCode::Tab => {
+                app.hub.architecture = match app.hub.architecture.as_str() {
+                    "2" => "1",
+                    "1" => "custom",
+                    _ => "2",
+                }
+                .to_owned();
+            }
+            _ => {
+                app.hub.error = None;
+                edit_hub_input(key, &mut app.hub.input);
+            }
+        },
+        HubScreen::Searching => {
+            if key.code == KeyCode::Esc {
+                app.hub.cancelled.store(true, Ordering::Relaxed);
+                app.set_status("CANCELLING HUB SEARCH …", false);
+            }
+        }
+        HubScreen::Results => match key.code {
+            KeyCode::Esc => app.hub.screen = HubScreen::Closed,
+            KeyCode::Up => app.hub.select_relative(-1),
+            KeyCode::Down => app.hub.select_relative(1),
+            KeyCode::Enter => {
+                if app.hub.selected_item().is_some() {
+                    app.hub.screen = HubScreen::Detail;
+                }
+            }
+            KeyCode::Char('d' | 'D') => start_hub_download(app, models),
+            KeyCode::Char('n' | 'N') => {
+                app.hub.input.set(app.hub.query.clone());
+                app.hub.screen = HubScreen::Query;
+            }
+            KeyCode::Left => change_hub_page(app, -1),
+            KeyCode::Right => change_hub_page(app, 1),
+            _ => {}
+        },
+        HubScreen::Detail => match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.hub.screen = HubScreen::Results,
+            KeyCode::Up => app.hub.select_relative(-1),
+            KeyCode::Down => app.hub.select_relative(1),
+            KeyCode::Char('d' | 'D') => start_hub_download(app, models),
+            KeyCode::Char('u' | 'U') => {
+                if let Some(item) = app.hub.selected_item() {
+                    app.external_text = Some(format!(
+                        "TONE3000 source for t3k:model:{}\n\n{}\n\nPress Enter to return to the TUI.",
+                        item.model_id, item.source_url
+                    ));
+                }
+            }
+            _ => {}
+        },
+        HubScreen::Downloading => {
+            if key.code == KeyCode::Esc {
+                app.set_status("FINISHING ONE VERIFIED DOWNLOAD · PLEASE WAIT", false);
+            }
+        }
+    }
+}
+
+fn edit_hub_input(key: KeyEvent, input: &mut TextInput) {
+    match key.code {
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            input.insert(&character.to_string());
+        }
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete(),
+        KeyCode::Left => input.move_left(),
+        KeyCode::Right => input.move_right(),
+        KeyCode::Home => input.cursor = 0,
+        KeyCode::End => input.cursor = input.value.len(),
+        _ => {}
+    }
+}
+
+fn start_hub_connect(app: &mut App) {
+    let client_id = app.hub.input.value.trim().to_owned();
+    let redirect_uri = match hub::suggested_redirect_uri() {
+        Ok(uri) => uri,
+        Err(error) => {
+            app.hub.error = Some(error.to_string());
+            app.set_status(error.to_string(), true);
+            return;
+        }
+    };
+    app.hub.cancelled = Arc::new(AtomicBool::new(false));
+    app.hub.error = None;
+    app.hub.authorization_qr = None;
+    app.hub.screen = HubScreen::Connecting;
+    let operation_id = app.hub.begin_operation();
+    let cancelled = Arc::clone(&app.hub.cancelled);
+    let qr_cancelled = Arc::clone(&app.hub.cancelled);
+    let sender = app.hub.event_sender.clone();
+    thread::spawn(move || {
+        let progress_sender = sender.clone();
+        let result = hub::connect_for_tui(
+            client_id,
+            redirect_uri,
+            &cancelled,
+            move |handoff_url, _redirect_uri| {
+                let qr = terminal_qr(&handoff_url).map_err(|error| error.to_string());
+                if qr.is_err() {
+                    qr_cancelled.store(true, Ordering::Relaxed);
+                }
+                progress_sender
+                    .send(HubEvent::AuthorizationReady { operation_id, qr })
+                    .ok();
+            },
+        )
+        .map_err(|error| error.to_string());
+        sender.send(HubEvent::Connected(operation_id, result)).ok();
+    });
+}
+
+fn start_hub_search(app: &mut App, page: usize) {
+    let query = app.hub.input.value.trim().to_owned();
+    if let Err(error) = crate::model_search::ModelSearch::parse(&query) {
+        app.hub.error = Some(error.to_string());
+        app.set_status(error.to_string(), true);
+        return;
+    }
+    app.hub.query = query.clone();
+    app.hub.error = None;
+    app.hub.cancelled = Arc::new(AtomicBool::new(false));
+    app.hub.screen = HubScreen::Searching;
+    let operation_id = app.hub.begin_operation();
+    let architecture = app.hub.architecture.clone();
+    let cancelled = Arc::clone(&app.hub.cancelled);
+    let sender = app.hub.event_sender.clone();
+    thread::spawn(move || {
+        let result = hub::search_for_tui(&query, page, &architecture, &cancelled)
+            .map_err(|error| error.to_string());
+        sender
+            .send(HubEvent::SearchFinished(operation_id, result))
+            .ok();
+    });
+}
+
+fn change_hub_page(app: &mut App, direction: i8) {
+    let Some(results) = &app.hub.results else {
+        return;
+    };
+    let next = if direction < 0 {
+        results.page.checked_sub(1)
+    } else {
+        let page = results.page + 1;
+        (page <= results.total_pages).then_some(page)
+    };
+    if let Some(page) = next {
+        app.hub.input.set(app.hub.query.clone());
+        start_hub_search(app, page);
+    } else {
+        app.set_status("ALREADY AT HUB PAGE EDGE", false);
+    }
+}
+
+fn start_hub_download(app: &mut App, models: &mut ModelDirectory) {
+    let Some(item) = app.hub.selected_item() else {
+        app.set_status("NO EXACT MODEL SELECTED", true);
+        return;
+    };
+    let model_id = item.model_id;
+    match hub::installed_model_path(model_id, models.root()) {
+        Ok(Some(path)) => {
+            models.select_path(&path);
+            app.hub.screen = HubScreen::Closed;
+            app.set_status("ALREADY DOWNLOADED · ENTER TO LOAD", false);
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            app.hub.error = Some(error.to_string());
+            app.set_status(error.to_string(), true);
+            return;
+        }
+    }
+    let models_dir = models.root().to_path_buf();
+    app.hub.error = None;
+    app.hub.screen = HubScreen::Downloading;
+    let operation_id = app.hub.begin_operation();
+    let sender = app.hub.event_sender.clone();
+    thread::spawn(move || {
+        let result =
+            hub::download_for_tui(model_id, &models_dir).map_err(|error| error.to_string());
+        sender
+            .send(HubEvent::DownloadFinished(operation_id, result))
+            .ok();
+    });
+}
+
+fn poll_hub(app: &mut App, models: &mut ModelDirectory) {
+    loop {
+        match app.hub.events.try_recv() {
+            Ok(event) => {
+                if event.operation_id() != app.hub.operation_id {
+                    continue;
+                }
+                match event {
+                    HubEvent::AuthorizationReady { qr, .. } => {
+                        if app.hub.screen == HubScreen::Connecting {
+                            match qr {
+                                Ok(qr) => {
+                                    app.hub.authorization_qr = Some(qr);
+                                    app.set_status("SCAN QR WITH PHONE · ESC CANCELS", false);
+                                }
+                                Err(error) => {
+                                    app.hub.begin_operation();
+                                    app.hub.screen = HubScreen::ClientId;
+                                    app.hub.error = Some(error.clone());
+                                    app.set_status(error, true);
+                                }
+                            }
+                        }
+                    }
+                    HubEvent::Connected(_, result) => match result {
+                        Ok(()) => {
+                            if app.hub.screen == HubScreen::Connecting {
+                                app.hub.input.set(app.hub.query.clone());
+                                app.hub.screen = HubScreen::Query;
+                                app.set_status("TONE3000 CONNECTED · ENTER A SEARCH", false);
+                            }
+                        }
+                        Err(error) => {
+                            if app.hub.screen == HubScreen::Connecting {
+                                app.hub.screen = HubScreen::ClientId;
+                            }
+                            app.hub.error = Some(error.clone());
+                            app.set_status(error, true);
+                        }
+                    },
+                    HubEvent::SearchFinished(_, result) => match result {
+                        Ok(results) => {
+                            let count = results.items.len();
+                            app.hub.results = Some(results);
+                            app.hub.selected = 0;
+                            app.hub.screen = HubScreen::Results;
+                            app.set_status(format!("HUB · {count} EXACT MATCH(ES)"), false);
+                        }
+                        Err(error) => {
+                            app.hub.input.set(app.hub.query.clone());
+                            app.hub.screen = HubScreen::Query;
+                            app.hub.error = Some(error.clone());
+                            app.set_status(error, true);
+                        }
+                    },
+                    HubEvent::DownloadFinished(_, result) => match result {
+                        Ok(path) => match models.refresh() {
+                            Ok(()) => {
+                                models.select_path(&path);
+                                app.hub.screen = HubScreen::Closed;
+                                app.set_status("DOWNLOADED ONE MODEL · ENTER TO LOAD", false);
+                            }
+                            Err(error) => {
+                                app.hub.screen = HubScreen::Results;
+                                app.set_status(
+                                    format!("DOWNLOADED; REFRESH FAILED · {error}"),
+                                    true,
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            app.hub.screen = HubScreen::Detail;
+                            app.hub.error = Some(error.clone());
+                            app.set_status(error, true);
+                        }
+                    },
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                app.set_status("HUB WORKER CHANNEL STOPPED", true);
+                break;
+            }
+        }
+    }
+}
+
+fn show_external_text(terminal: &mut Terminal<CrosstermBackend<Stdout>>, text: &str) -> Result<()> {
+    disable_raw_mode().context("pause raw mode for external text")?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .context("show external text outside TUI")?;
+    println!("\n{text}\n");
+    print!("> ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("wait before returning to TUI")?;
+    enable_raw_mode().context("restore terminal raw mode")?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .context("restore TUI after external text")?;
+    terminal.clear().ok();
+    Ok(())
+}
+
 fn handle_mouse(
     mouse: MouseEvent,
     app: &mut App,
@@ -261,6 +786,16 @@ fn handle_mouse(
     models: &mut ModelDirectory,
     midi: &mut MidiController,
 ) {
+    if app.hub.is_open() {
+        if matches!(app.hub.screen, HubScreen::Results | HubScreen::Detail) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.hub.select_relative(-1),
+                MouseEventKind::ScrollDown => app.hub.select_relative(1),
+                _ => {}
+            }
+        }
+        return;
+    }
     if app.help {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             app.help = false;
@@ -349,6 +884,20 @@ fn handle_midi(
             );
         }
         MidiAction::OversamplingOff => app.set_status("OVERSAMPLING OFF IN V1", false),
+    }
+}
+
+fn handle_hub_midi(action: MidiAction, app: &mut App) {
+    match action {
+        MidiAction::Select(direction)
+            if matches!(app.hub.screen, HubScreen::Results | HubScreen::Detail) =>
+        {
+            app.hub.select_relative(direction);
+        }
+        MidiAction::Parameter(parameter) => app.focus = parameter,
+        MidiAction::Learned { parameter, .. } => app.focus = parameter,
+        MidiAction::OversamplingOff => app.set_status("OVERSAMPLING OFF IN V1", false),
+        MidiAction::Select(_) | MidiAction::Load => {}
     }
 }
 
@@ -663,8 +1212,13 @@ fn draw(
     // Rows 1-12 are body-owned. Row 13 is cleared and replaced only by
     // draw_status(), matching shr-daw's shared working-screen contract.
     frame.render_widget(Clear, Rect::new(area.x, area.y, area.width, 12));
-    draw_chain_header(frame, area, app, models);
     let telemetry = app.telemetry.snapshot();
+    if app.hub.is_open() {
+        draw_hub(frame, area, app);
+        draw_status(frame, row(area, 12), app, midi, telemetry, period, cpu);
+        return;
+    }
+    draw_chain_header(frame, area, app, models);
     draw_meter(
         frame,
         row(area, 3),
@@ -688,6 +1242,451 @@ fn draw(
     if app.help {
         draw_help(frame, area);
     }
+}
+
+fn draw_hub(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect, app: &App) {
+    match app.hub.screen {
+        HubScreen::Closed => {}
+        HubScreen::ClientId => {
+            draw_text(frame, row(area, 0), "HUB · CONNECT TONE3000", Color::White);
+            draw_text(
+                frame,
+                row(area, 1),
+                "INSTALLATION PUBLIC CLIENT ID",
+                Color::Gray,
+            );
+            draw_hub_input(frame, Rect::new(area.x, area.y + 2, 40, 5), &app.hub.input);
+            draw_text(
+                frame,
+                row(area, 7),
+                "PUBLISHABLE ID ONLY · NEVER SECRET KEY",
+                Color::LightYellow,
+            );
+            if let Some(error) = &app.hub.error {
+                draw_hub_error(frame, Rect::new(area.x, area.y + 8, 40, 2), error);
+            } else {
+                draw_text(
+                    frame,
+                    row(area, 8),
+                    "CALLBACK USES THIS PI'S CURRENT WIFI IP",
+                    Color::Gray,
+                );
+            }
+            draw_text(
+                frame,
+                row(area, 10),
+                "ENTER CONNECT · ESC BACK",
+                Color::White,
+            );
+            draw_text(
+                frame,
+                row(area, 11),
+                "TOKEN STORED OWNER-ONLY ON THIS PI",
+                Color::Gray,
+            );
+        }
+        HubScreen::Connecting => {
+            if let Some(qr) = &app.hub.authorization_qr {
+                let height = qr.len() as u16;
+                let width = qr.first().map_or(0, |line| line.chars().count()) as u16;
+                let qr_area = Rect::new(
+                    area.x + area.width.saturating_sub(width) / 2,
+                    area.y + 11_u16.saturating_sub(height) / 2,
+                    width.min(area.width),
+                    height.min(11),
+                );
+                frame.render_widget(
+                    Paragraph::new(qr.join("\n"))
+                        .style(Style::default().fg(Color::Black).bg(Color::White)),
+                    qr_area,
+                );
+                draw_text(
+                    frame,
+                    row(area, 11),
+                    "SCAN QR WITH PHONE · ESC CANCEL",
+                    Color::White,
+                );
+            } else {
+                draw_text(
+                    frame,
+                    row(area, 0),
+                    "HUB · AUTHORIZE TONE3000",
+                    Color::White,
+                );
+                draw_text(
+                    frame,
+                    row(area, 3),
+                    "BUILDING SECURE LOGIN QR …",
+                    Color::LightYellow,
+                );
+                draw_text(
+                    frame,
+                    row(area, 11),
+                    "ESC CANCELS AND KEEPS CLIENT ID",
+                    Color::White,
+                );
+            }
+        }
+        HubScreen::Query => {
+            draw_text(
+                frame,
+                row(area, 0),
+                &format!("SMART HUB SEARCH · NAM{}", app.hub.architecture),
+                Color::White,
+            );
+            draw_text(
+                frame,
+                row(area, 1),
+                "EXACT DOCUMENTED CAPTURE SETTINGS",
+                Color::Gray,
+            );
+            draw_hub_input(frame, Rect::new(area.x, area.y + 2, 40, 6), &app.hub.input);
+            if let Some(error) = &app.hub.error {
+                draw_hub_error(frame, Rect::new(area.x, area.y + 8, 40, 2), error);
+            } else {
+                draw_text(
+                    frame,
+                    row(area, 8),
+                    "EX: JCM BASS 3-4 MID 6+ HIGH 2-3",
+                    Color::Gray,
+                );
+                draw_text(frame, row(area, 9), "TAB ARCH: 2 / 1 / CUSTOM", Color::Gray);
+            }
+            draw_text(frame, row(area, 10), "ENTER SEARCH METADATA", Color::White);
+            draw_text(
+                frame,
+                row(area, 11),
+                "ESC BACK · INPUT IS KEPT ON ERRORS",
+                Color::Gray,
+            );
+        }
+        HubScreen::Searching => {
+            draw_text(
+                frame,
+                row(area, 0),
+                "HUB · SEARCHING METADATA",
+                Color::White,
+            );
+            draw_text(frame, row(area, 2), &app.hub.query, Color::LightYellow);
+            draw_text(
+                frame,
+                row(area, 5),
+                "NO MODEL FILES ARE BEING DOWNLOADED",
+                Color::Gray,
+            );
+            draw_text(
+                frame,
+                row(area, 7),
+                "CHECKING EACH CAPTURE'S OWN SETTINGS",
+                Color::Gray,
+            );
+            draw_text(
+                frame,
+                row(area, 10),
+                "PLEASE WAIT · AUDIO STAYS LIVE",
+                Color::White,
+            );
+            draw_text(
+                frame,
+                row(area, 11),
+                "ESC CANCELS AFTER CURRENT REQUEST",
+                Color::Gray,
+            );
+        }
+        HubScreen::Results => draw_hub_result(frame, area, app, false),
+        HubScreen::Detail => draw_hub_result(frame, area, app, true),
+        HubScreen::Downloading => {
+            draw_text(
+                frame,
+                row(area, 0),
+                "HUB · DOWNLOADING ONE MODEL",
+                Color::White,
+            );
+            if let Some(item) = app.hub.selected_item() {
+                draw_text(frame, row(area, 2), &item.tone_title, Color::LightYellow);
+                draw_text(frame, row(area, 3), &item.model_name, Color::White);
+                draw_text(frame, row(area, 4), &item.settings, Color::Gray);
+                draw_text(
+                    frame,
+                    row(area, 6),
+                    &format!("EXACT ID t3k:model:{}", item.model_id),
+                    Color::Gray,
+                );
+            }
+            draw_text(
+                frame,
+                row(area, 8),
+                "VALIDATING NAM BEFORE PUBLISHING",
+                Color::Gray,
+            );
+            draw_text(
+                frame,
+                row(area, 10),
+                "AUDIO STAYS ON CURRENT CHAIN",
+                Color::White,
+            );
+            draw_text(
+                frame,
+                row(area, 11),
+                "DOWNLOAD FINISHES ATOMICALLY",
+                Color::Gray,
+            );
+        }
+    }
+}
+
+fn draw_hub_input(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect, input: &TextInput) {
+    let mut value = input.value.clone();
+    value.insert(input.cursor, '▏');
+    frame.render_widget(
+        Paragraph::new(value)
+            .block(
+                Block::default()
+                    .title(" TYPE OR PASTE ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::LightYellow)),
+            )
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn terminal_qr(value: &str) -> Result<Vec<String>> {
+    const QUIET_ZONE: usize = 4;
+    const QR_ROWS: usize = 11;
+
+    let code = QrCode::with_error_correction_level(value.as_bytes(), EcLevel::L)
+        .context("build authorization QR")?;
+    let module_width = code.width();
+    let total = module_width + QUIET_ZONE * 2;
+    let columns = total.div_ceil(2);
+    let rows = total.div_ceil(4);
+    if columns > usize::from(WIDTH) || rows > QR_ROWS {
+        anyhow::bail!("authorization QR does not fit the 40x13 display");
+    }
+
+    let mut output = Vec::with_capacity(rows);
+    for cell_y in 0..rows {
+        let mut line = String::with_capacity(columns * 3);
+        for cell_x in 0..columns {
+            let mut dots = 0_u32;
+            for dot_y in 0..4 {
+                for dot_x in 0..2 {
+                    let x = cell_x * 2 + dot_x;
+                    let y = cell_y * 4 + dot_y;
+                    let in_code = x >= QUIET_ZONE
+                        && y >= QUIET_ZONE
+                        && x < QUIET_ZONE + module_width
+                        && y < QUIET_ZONE + module_width;
+                    if in_code && code[(x - QUIET_ZONE, y - QUIET_ZONE)] == QrColor::Dark {
+                        dots |= braille_dot(dot_x, dot_y);
+                    }
+                }
+            }
+            line.push(char::from_u32(0x2800 + dots).expect("valid Braille code point"));
+        }
+        output.push(line);
+    }
+    Ok(output)
+}
+
+fn braille_dot(x: usize, y: usize) -> u32 {
+    match (x, y) {
+        (0, 0) => 1 << 0,
+        (0, 1) => 1 << 1,
+        (0, 2) => 1 << 2,
+        (1, 0) => 1 << 3,
+        (1, 1) => 1 << 4,
+        (1, 2) => 1 << 5,
+        (0, 3) => 1 << 6,
+        (1, 3) => 1 << 7,
+        _ => 0,
+    }
+}
+
+fn draw_hub_result(
+    frame: &mut Frame<CrosstermBackend<Stdout>>,
+    area: Rect,
+    app: &App,
+    detail: bool,
+) {
+    let Some(results) = &app.hub.results else {
+        draw_text(
+            frame,
+            row(area, 0),
+            "HUB · NO RESULT STATE",
+            Color::LightYellow,
+        );
+        return;
+    };
+    if results.items.is_empty() {
+        draw_text(frame, row(area, 0), "HUB · 0 EXACT MATCHES", Color::White);
+        draw_text(
+            frame,
+            row(area, 2),
+            &format!("{} MODEL RECORDS SCANNED", results.models_scanned),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 3),
+            &format!(
+                "{} MISSING REQUESTED METADATA",
+                results.models_missing_settings
+            ),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 5),
+            "CONSTRAINTS WERE NOT RELAXED",
+            Color::LightYellow,
+        );
+        draw_text(
+            frame,
+            row(area, 8),
+            &format!(
+                "TONE PAGE {}/{} · {} TOTAL",
+                results.page, results.total_pages, results.tones_total
+            ),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 10),
+            "LEFT/RIGHT PAGE · N NEW SEARCH",
+            Color::White,
+        );
+        draw_text(frame, row(area, 11), "ESC BACK TO AMP", Color::Gray);
+        return;
+    }
+    let Some(item) = app.hub.selected_item() else {
+        return;
+    };
+    draw_text(
+        frame,
+        row(area, 0),
+        &format!(
+            "HUB {} {}/{} · PAGE {}/{}",
+            if detail { "DETAIL" } else { "RESULT" },
+            app.hub.selected + 1,
+            results.items.len(),
+            results.page,
+            results.total_pages
+        ),
+        Color::White,
+    );
+    draw_text(frame, row(area, 1), &item.tone_title, Color::LightYellow);
+    draw_text(frame, row(area, 2), &item.model_name, Color::White);
+    draw_text(frame, row(area, 3), &item.settings, Color::LightYellow);
+    if detail {
+        draw_text(
+            frame,
+            row(area, 4),
+            &format!("MAKE {}", item.make),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 5),
+            &format!("MATCH {}", item.matched),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 6),
+            &format!("FROM {}", item.setting_sources),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 7),
+            &format!(
+                "@{} · {} · {} · NAM{}",
+                item.creator, item.license, item.size, item.architecture
+            ),
+            Color::Gray,
+        );
+        if let Some(error) = &app.hub.error {
+            draw_hub_error(frame, Rect::new(area.x, area.y + 8, 40, 2), error);
+        } else {
+            draw_text(frame, row(area, 8), &item.source_url, Color::Gray);
+            draw_text(
+                frame,
+                row(area, 9),
+                &format!("EXACT ID t3k:model:{}", item.model_id),
+                Color::Gray,
+            );
+        }
+        draw_text(
+            frame,
+            row(area, 10),
+            "D DOWNLOAD ONE · U FULL SOURCE",
+            Color::White,
+        );
+        draw_text(
+            frame,
+            row(area, 11),
+            "UP/DN RESULT · ENTER/ESC LIST",
+            Color::Gray,
+        );
+    } else {
+        draw_text(
+            frame,
+            row(area, 4),
+            &format!("MATCH {}", item.matched),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 5),
+            &format!("FROM {}", item.setting_sources),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 6),
+            &format!("@{} · {}", item.creator, item.license),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 7),
+            &format!(
+                "EXACT ID t3k:model:{} · NAM{}",
+                item.model_id, item.architecture
+            ),
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 9),
+            "UP/DN RESULT · LEFT/RIGHT PAGE",
+            Color::Gray,
+        );
+        draw_text(
+            frame,
+            row(area, 10),
+            "ENTER DETAILS · D DOWNLOAD ONE",
+            Color::White,
+        );
+        draw_text(
+            frame,
+            row(area, 11),
+            "N NEW SEARCH · ESC BACK TO AMP",
+            Color::Gray,
+        );
+    }
+}
+
+fn draw_hub_error(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect, error: &str) {
+    frame.render_widget(
+        Paragraph::new(format!("ERROR · {error}"))
+            .style(Style::default().fg(Color::LightYellow))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn draw_chain_header(
@@ -971,7 +1970,7 @@ fn draw_hints(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect, app: &App
     draw_text(
         frame,
         row(area, 10),
-        "PEDAL > AMP > CAB > MIC* (VIRTUAL)",
+        "H HUB · PEDAL > AMP > CAB > MIC*",
         Color::White,
     );
     if app.mic_focus {
@@ -1067,7 +2066,7 @@ fn draw_status(
 }
 
 fn draw_help(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect) {
-    let popup = Rect::new(area.x + 1, area.y + 1, 38, 9);
+    let popup = Rect::new(area.x + 1, area.y + 1, 38, 10);
     frame.render_widget(Clear, popup);
     let help = [
         "UP/DOWN browse · LEFT/RIGHT stage",
@@ -1075,6 +2074,7 @@ fn draw_help(frame: &mut Frame<CrosstermBackend<Stdout>>, area: Rect) {
         "A add · ENTER replace · D delete",
         "[ / ] move slot · R reload chain",
         "I/O +0.5 dB · Shift I/O +3 dB",
+        "H smart hub search/download one model",
         "MIC* is virtual; one cabinet DSP slot",
         "Q or ESC quits · ? closes help",
     ]
@@ -1229,5 +2229,50 @@ mod tests {
         assert_eq!(relative_index(0, 3, -1), 2);
         assert_eq!(relative_index(2, 3, 1), 0);
         assert_eq!(relative_index(1, 3, 1), 2);
+    }
+
+    #[test]
+    fn hub_text_input_edits_unicode_without_losing_the_query() {
+        let mut input = TextInput::default();
+        input.insert("mid 6+ treble ≤3");
+        input.move_left();
+        input.backspace();
+        input.insert("≤");
+        input.move_right();
+        input.backspace();
+        input.insert("2");
+        assert_eq!(input.value, "mid 6+ treble ≤2");
+    }
+
+    #[test]
+    fn hub_text_input_filters_terminal_controls() {
+        let mut input = TextInput::default();
+        input.insert("JCM\n\u{1b}[31m bass 3");
+        assert_eq!(input.value, "JCM[31m bass 3");
+    }
+
+    #[test]
+    fn authorization_qr_fits_the_fixed_terminal() {
+        let qr = terminal_qr("http://192.168.100.200:43900/").unwrap();
+        assert!(qr.len() <= 11);
+        assert!(qr.iter().all(|line| line.chars().count() <= 40));
+        assert!(qr
+            .iter()
+            .flat_map(|line| line.chars())
+            .any(|character| character != '\u{2800}'));
+    }
+
+    #[test]
+    fn braille_qr_dot_positions_are_distinct() {
+        let mut combined = 0_u32;
+        for y in 0..4 {
+            for x in 0..2 {
+                let dot = braille_dot(x, y);
+                assert_eq!(dot.count_ones(), 1);
+                assert_eq!(combined & dot, 0);
+                combined |= dot;
+            }
+        }
+        assert_eq!(combined, 0xff);
     }
 }

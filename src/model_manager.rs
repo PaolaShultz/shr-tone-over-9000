@@ -34,6 +34,11 @@ struct ManagerOptions {
     microphone: Option<String>,
     position: Option<String>,
     variant: Option<String>,
+    client_id: Option<String>,
+    redirect_uri: Option<String>,
+    auth_file: Option<PathBuf>,
+    page: Option<usize>,
+    architecture: Option<String>,
 }
 
 fn run(arguments: Vec<OsString>) -> Result<()> {
@@ -111,6 +116,24 @@ fn run(arguments: Vec<OsString>) -> Result<()> {
                 .map(String::as_str)
                 .unwrap_or("all"),
         )?,
+        "hub" => {
+            let command = options.positional.get(1).map(String::as_str);
+            let arguments = options.positional.get(2..).unwrap_or_default();
+            crate::hub::run(
+                command,
+                arguments,
+                crate::hub::HubOptions {
+                    models_dir,
+                    client_id: options.client_id,
+                    redirect_uri: options.redirect_uri,
+                    auth_file: options.auth_file,
+                    page: options.page.unwrap_or(1),
+                    architecture: options.architecture.unwrap_or_else(|| "2".to_owned()),
+                    name: options.name,
+                    replace: options.replace,
+                },
+            )?;
+        }
         _ => bail!("unknown models command {command:?}; use `models help`"),
     }
     Ok(())
@@ -137,6 +160,30 @@ fn parse(arguments: Vec<OsString>) -> Result<ManagerOptions> {
             "--mic" => parsed.microphone = Some(next_utf8(&mut arguments, "--mic")?),
             "--position" => parsed.position = Some(next_utf8(&mut arguments, "--position")?),
             "--variant" => parsed.variant = Some(next_utf8(&mut arguments, "--variant")?),
+            "--client-id" => parsed.client_id = Some(next_utf8(&mut arguments, "--client-id")?),
+            "--redirect-uri" => {
+                parsed.redirect_uri = Some(next_utf8(&mut arguments, "--redirect-uri")?)
+            }
+            "--auth-file" => {
+                parsed.auth_file = Some(PathBuf::from(next_utf8(&mut arguments, "--auth-file")?))
+            }
+            "--page" => {
+                let value = next_utf8(&mut arguments, "--page")?;
+                let page = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --page {value:?}"))?;
+                if page == 0 {
+                    bail!("--page must be at least 1");
+                }
+                parsed.page = Some(page);
+            }
+            "--architecture" => {
+                let value = next_utf8(&mut arguments, "--architecture")?;
+                if !matches!(value.as_str(), "1" | "2" | "custom") {
+                    bail!("--architecture must be 1, 2, or custom");
+                }
+                parsed.architecture = Some(value);
+            }
             value if value.starts_with('-') => bail!("unknown model-manager option {value:?}"),
             value => parsed.positional.push(value.to_owned()),
         }
@@ -445,13 +492,13 @@ fn download_and_commit(
     Ok(())
 }
 
-fn validate_asset(path: &Path) -> Result<()> {
+pub(crate) fn validate_asset(path: &Path) -> Result<()> {
     NamChain::load(&[path.to_path_buf()], SAMPLE_RATE, 256)
         .with_context(|| format!("validate downloaded asset {}", path.display()))?;
     Ok(())
 }
 
-fn safe_file_name(name: &str) -> Result<&str> {
+pub(crate) fn safe_file_name(name: &str) -> Result<&str> {
     let path = Path::new(name);
     if name.is_empty() || path.file_name().and_then(|value| value.to_str()) != Some(name) {
         bail!("asset name must be a plain filename");
@@ -467,7 +514,7 @@ fn safe_file_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-fn temporary_path(destination: &Path) -> Result<PathBuf> {
+pub(crate) fn temporary_path(destination: &Path) -> Result<PathBuf> {
     let file = destination
         .file_name()
         .and_then(|value| value.to_str())
@@ -488,7 +535,7 @@ fn installed_matches(path: &Path, expected: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut digest = Sha256::new();
@@ -543,6 +590,7 @@ fn print_help() {
          rpi-tone-over-9000 models import PATH [--name FILE] [--replace] [IR METADATA]\n\
          rpi-tone-over-9000 models add-url HTTPS_URL --name FILE [--sha256 HASH] [--replace] [IR METADATA]\n\
          rpi-tone-over-9000 models browse [all|pedal|amp|cab|rig]\n\
+         rpi-tone-over-9000 models hub COMMAND [OPTIONS]\n\
          \n\
          Common option: --models-dir DIR (default: user data directory)\n\
          IR metadata: --cab-id ID --cabinet LABEL --speaker LABEL --mic LABEL\n\
@@ -550,7 +598,8 @@ fn print_help() {
          Downloads and imports are validated before an atomic rename. Existing\n\
          files are preserved unless --replace is explicit. TONE3000 catalog\n\
          files require acknowledgement because T3K permits local use but not\n\
-         redistribution."
+         redistribution. Run `models hub help` for metadata search and exact\n\
+         one-model downloads."
     );
 }
 
@@ -666,5 +715,35 @@ mod tests {
         let staging = library.join(".rpi-tone-over-9000-staging");
         assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hub_options_preserve_query_and_validate_paging() {
+        let options = parse(
+            [
+                "hub",
+                "search",
+                "marshall",
+                "jcm",
+                "bass",
+                "3-4",
+                "--page",
+                "2",
+                "--architecture",
+                "1",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            options.positional,
+            ["hub", "search", "marshall", "jcm", "bass", "3-4"]
+        );
+        assert_eq!(options.page, Some(2));
+        assert_eq!(options.architecture.as_deref(), Some("1"));
+        assert!(parse(vec![OsString::from("--page"), OsString::from("0")]).is_err());
+        assert!(parse(vec![OsString::from("--architecture"), OsString::from("3")]).is_err());
     }
 }
