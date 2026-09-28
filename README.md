@@ -1,4 +1,4 @@
-# rpi-tone-over-9000
+# shr-tone-over-9000
 
 A minimal Raspberry Pi 5 amp sim: one Rust process, one mono JACK client,
 NeuralAmpModelerCore, cabinet convolution, and one 40×13 terminal screen. It
@@ -70,14 +70,14 @@ attaches only to the requested ports. Start the already-owned JACK service at
 48 kHz, either 128 or 256 frames, and three periods, then run:
 
 ```sh
-target/debug/rpi-tone-over-9000
+target/debug/shr-tone-over-9000
 ```
 
 The app detects the live JACK period automatically. To require a particular
 period in a script or diagnostic check, pass it explicitly:
 
 ```sh
-target/debug/rpi-tone-over-9000 --period 128
+target/debug/shr-tone-over-9000 --period 128
 ```
 
 `--period` is optional and validates JACK's live period when supplied. It does
@@ -105,8 +105,8 @@ period durations are not a measured round-trip claim.
 ## Models, cabinets, and controls
 
 The default library is
-`$XDG_DATA_HOME/rpi-tone-over-9000/models`, falling back to
-`$HOME/.local/share/rpi-tone-over-9000/models`. Override it with
+`$XDG_DATA_HOME/shr-tone-over-9000/models`, falling back to
+`$HOME/.local/share/shr-tone-over-9000/models`. Override it with
 `RPI_TONE_MODELS_DIR` or `--models-dir DIR`. The directory is watched and the
 browser wraps.
 
@@ -114,10 +114,10 @@ The built-in catalog contains five pedal NAMs, five amp-head NAMs, five
 amp-plus-cab rig NAMs, and five cabinet IRs. Install and inspect it with:
 
 ```sh
-rpi-tone-over-9000 models list
-rpi-tone-over-9000 models install all --accept-t3k
-rpi-tone-over-9000 models verify all
-rpi-tone-over-9000 models browse cab
+shr-tone-over-9000 models list
+shr-tone-over-9000 models install all --accept-t3k
+shr-tone-over-9000 models verify all
+shr-tone-over-9000 models browse cab
 ```
 
 `models browse pedal|amp|cab|rig` opens the filtered official TONE3000 website
@@ -125,8 +125,8 @@ when a desktop browser is available and always prints the URL. Download a
 chosen `.nam` or `.wav` asset manually, then add it safely:
 
 ```sh
-rpi-tone-over-9000 models import ~/Downloads/my-amp.nam
-rpi-tone-over-9000 models add-url https://example.org/my-cab.wav \
+shr-tone-over-9000 models import ~/Downloads/my-amp.nam
+shr-tone-over-9000 models add-url https://example.org/my-cab.wav \
   --name my-cab.wav --sha256 EXPECTED_SHA256
 ```
 
@@ -175,8 +175,8 @@ scripts/install.sh --tone3000-client-id t3k_pub_YOUR_KEY
 ```
 
 This writes owner-only
-`$XDG_CONFIG_HOME/rpi-tone-over-9000/hub.conf`, falling back to
-`$HOME/.config/rpi-tone-over-9000/hub.conf`. Another installation supplies its
+`$XDG_CONFIG_HOME/shr-tone-over-9000/hub.conf`, falling back to
+`$HOME/.config/shr-tone-over-9000/hub.conf`. Another installation supplies its
 own ID. `TONE3000_CLIENT_ID` and `RPI_TONE_HUB_CONFIG` remain deployment
 overrides. Never put the TONE3000 secret key on this device.
 
@@ -187,20 +187,20 @@ allowed redirects. Connect once; the default callback is suitable when the
 browser runs on the same machine:
 
 ```sh
-rpi-tone-over-9000 models hub connect --client-id t3k_pub_YOUR_KEY
+shr-tone-over-9000 models hub connect --client-id t3k_pub_YOUR_KEY
 ```
 
 On a headless Pi, use its private LAN address. The CLI prints only the short
 Pi-local handoff URL, which must be opened on a phone connected to the same LAN:
 
 ```sh
-rpi-tone-over-9000 models hub connect --client-id t3k_pub_YOUR_KEY \
+shr-tone-over-9000 models hub connect --client-id t3k_pub_YOUR_KEY \
   --redirect-uri http://192.168.1.50:43900/callback
 ```
 
 Credentials are stored at
-`$XDG_CONFIG_HOME/rpi-tone-over-9000/tone3000-auth.json`, falling back to
-`$HOME/.config/rpi-tone-over-9000/tone3000-auth.json`, with mode 0600. Override
+`$XDG_CONFIG_HOME/shr-tone-over-9000/tone3000-auth.json`, falling back to
+`$HOME/.config/shr-tone-over-9000/tone3000-auth.json`, with mode 0600. Override
 the location with `RPI_TONE_HUB_AUTH` or `--auth-file`. The secret TONE3000 key
 is server-only and must never be supplied to this application.
 
@@ -208,7 +208,7 @@ Search amp and capture settings using one query. `high`/`highs` is normalized
 to `treble`, and `middle`/`mids` to `mid`:
 
 ```sh
-rpi-tone-over-9000 models hub search \
+shr-tone-over-9000 models hub search \
   "marshall jcm with bass on 3-4 and mid on 6+ and high on 2-3"
 ```
 
@@ -228,8 +228,8 @@ models.
 Results are model-scoped handles. Inspect and download exactly one:
 
 ```sh
-rpi-tone-over-9000 models hub show t3k:model:88421
-rpi-tone-over-9000 models hub download t3k:model:88421
+shr-tone-over-9000 models hub show t3k:model:88421
+shr-tone-over-9000 models hub download t3k:model:88421
 ```
 
 Search and show retrieve JSON metadata only. Only `hub download` fetches binary
@@ -237,7 +237,7 @@ model data, and it accepts exactly one `t3k:model:ID`, never a tone/pack ID. The
 download is limited to 100 MiB, staged, test-loaded, hashed, and atomically
 installed. Its TONE3000 identity, creator, license, source, parsed settings,
 evidence, and SHA-256 are recorded in
-`.rpi-tone-over-9000-models.json` beside the models. Use `--name FILE.nam` to
+`.shr-tone-over-9000-models.json` beside the models. Use `--name FILE.nam` to
 choose a local filename or `--replace` to replace an existing one explicitly.
 
 The hub defaults to NAM architecture 2. Pass `--architecture 1` or
@@ -252,10 +252,10 @@ while importing each WAV. Files with the same `--cab-id` become variants of one
 virtual microphone selector:
 
 ```sh
-rpi-tone-over-9000 models import mesa-sm57-edge.wav \
+shr-tone-over-9000 models import mesa-sm57-edge.wav \
   --cab-id mesa-412-v30 --cabinet "Mesa 4x12" --speaker V30 \
   --mic SM57 --position "cap edge" --variant "57 edge"
-rpi-tone-over-9000 models import mesa-r121-cone.wav \
+shr-tone-over-9000 models import mesa-r121-cone.wav \
   --cab-id mesa-412-v30 --cabinet "Mesa 4x12" --speaker V30 \
   --mic R121 --position cone --variant "121 cone"
 ```
@@ -391,3 +391,19 @@ vcgencmd measure_temp
 Software compilation alone cannot establish zero xruns, physical interface
 behavior, touch calibration, controller acceptance, thermal headroom, or
 listening quality on the target Pi.
+
+## Rename compatibility
+
+The repository, checkout and executable are `shr-tone-over-9000`. New model
+and account directories use that name. If the new path is absent, the app
+continues to use an existing `rpi-tone-over-9000` model or account path.
+Explicit `RPI_TONE_MODELS_DIR`, `RPI_TONE_HUB_CONFIG` and `RPI_TONE_HUB_AUTH`
+overrides remain supported. Library metadata filenames
+`.rpi-tone-over-9000-ir.tsv` and `.rpi-tone-over-9000-models.json` stay stable so
+existing IR descriptions and model provenance remain intact. These are format
+compatibility names, not stale repository links.
+
+To move an existing installation to the new default layout, close the app,
+move its directories under `~/.local/share/` and `~/.config/` to
+`shr-tone-over-9000` (only if those destinations do not exist), then run
+`scripts/install.sh --no-models`. This preserves model files and credentials.

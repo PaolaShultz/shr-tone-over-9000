@@ -334,7 +334,7 @@ fn connect(
     wanted: &str,
     sender: mpsc::Sender<RawMidi>,
 ) -> Result<(MidiInputConnection<()>, String)> {
-    let mut input = MidiInput::new("rpi-tone-over-9000 MIDI input")?;
+    let mut input = MidiInput::new("shr-tone-over-9000 MIDI input")?;
     input.ignore(Ignore::None);
     let ports = input.ports();
     let names = ports
@@ -359,7 +359,7 @@ fn connect(
     let connection = input
         .connect(
             &ports[index],
-            "rpi-tone-over-9000 monitor",
+            "shr-tone-over-9000 monitor",
             move |_stamp, message, _| {
                 if message.len() >= 3 {
                     let _ = sender.send(RawMidi {

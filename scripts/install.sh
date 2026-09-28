@@ -4,12 +4,12 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 account_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
 install_prefix="${PREFIX:-${account_home}/.local}"
-models_dir="${RPI_TONE_MODELS_DIR:-${XDG_DATA_HOME:-${account_home}/.local/share}/rpi-tone-over-9000/models}"
+models_dir="${RPI_TONE_MODELS_DIR:-${XDG_DATA_HOME:-${account_home}/.local/share}/shr-tone-over-9000/models}"
 accept_t3k=false
 install_models=true
 system_deps=false
 tone3000_client_id=""
-hub_config="${RPI_TONE_HUB_CONFIG:-${XDG_CONFIG_HOME:-${account_home}/.config}/rpi-tone-over-9000/hub.conf}"
+hub_config="${RPI_TONE_HUB_CONFIG:-${XDG_CONFIG_HOME:-${account_home}/.config}/shr-tone-over-9000/hub.conf}"
 
 usage() {
     printf '%s\n' \
@@ -83,8 +83,8 @@ if [[ ! -d "$core_dir" ]]; then
 fi
 
 cargo build --manifest-path "${repo_dir}/Cargo.toml" --release --locked
-install -Dm755 "${repo_dir}/target/release/rpi-tone-over-9000" \
-    "${install_prefix}/bin/rpi-tone-over-9000"
+install -Dm755 "${repo_dir}/target/release/shr-tone-over-9000" \
+    "${install_prefix}/bin/shr-tone-over-9000"
 
 if [[ -n "$tone3000_client_id" ]]; then
     install -d -m700 "$(dirname "$hub_config")"
@@ -94,10 +94,10 @@ fi
 
 if "$install_models"; then
     if "$accept_t3k"; then
-        "${install_prefix}/bin/rpi-tone-over-9000" models install all \
+        "${install_prefix}/bin/shr-tone-over-9000" models install all \
             --models-dir "$models_dir" --accept-t3k
     else
-        "${install_prefix}/bin/rpi-tone-over-9000" models install cab \
+        "${install_prefix}/bin/shr-tone-over-9000" models install cab \
             --models-dir "$models_dir"
         printf '%s\n' \
             'Installed the five CC0 cabinet IRs.' \
@@ -106,7 +106,7 @@ if "$install_models"; then
     fi
 fi
 
-printf 'Installed %s\n' "${install_prefix}/bin/rpi-tone-over-9000"
+printf 'Installed %s\n' "${install_prefix}/bin/shr-tone-over-9000"
 if "$install_models"; then
     printf 'Model library: %s\n' "$models_dir"
 fi

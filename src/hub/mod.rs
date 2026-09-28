@@ -705,10 +705,10 @@ fn print_help() {
     println!(
         "TONE3000 metadata search and one-model download\n\
          \n\
-         rpi-tone-over-9000 models hub connect --client-id t3k_pub_…\n\
-         rpi-tone-over-9000 models hub search QUERY [--page N] [--architecture 1|2|custom]\n\
-         rpi-tone-over-9000 models hub show t3k:model:ID\n\
-         rpi-tone-over-9000 models hub download t3k:model:ID [--name FILE.nam] [--replace]\n\
+         shr-tone-over-9000 models hub connect --client-id t3k_pub_…\n\
+         shr-tone-over-9000 models hub search QUERY [--page N] [--architecture 1|2|custom]\n\
+         shr-tone-over-9000 models hub show t3k:model:ID\n\
+         shr-tone-over-9000 models hub download t3k:model:ID [--name FILE.nam] [--replace]\n\
          \n\
          Search reads tone/model metadata only. A download command requires one\n\
          exact model ID and downloads one .nam file. Settings are extracted only\n\

@@ -522,7 +522,7 @@ pub(crate) fn temporary_path(destination: &Path) -> Result<PathBuf> {
     let parent = destination
         .parent()
         .context("asset destination needs a parent directory")?;
-    let staging = parent.join(".rpi-tone-over-9000-staging");
+    let staging = parent.join(".shr-tone-over-9000-staging");
     fs::create_dir_all(&staging)
         .with_context(|| format!("create staging directory {}", staging.display()))?;
     Ok(staging.join(format!("{}-{file}", std::process::id())))
@@ -584,13 +584,13 @@ fn print_help() {
     println!(
         "Model and cabinet manager\n\
          \n\
-         rpi-tone-over-9000 models list [pedal|amp|cab|rig]\n\
-         rpi-tone-over-9000 models install [starter|CATEGORY|ID] [--accept-t3k]\n\
-         rpi-tone-over-9000 models verify [starter|CATEGORY|ID]\n\
-         rpi-tone-over-9000 models import PATH [--name FILE] [--replace] [IR METADATA]\n\
-         rpi-tone-over-9000 models add-url HTTPS_URL --name FILE [--sha256 HASH] [--replace] [IR METADATA]\n\
-         rpi-tone-over-9000 models browse [all|pedal|amp|cab|rig]\n\
-         rpi-tone-over-9000 models hub COMMAND [OPTIONS]\n\
+         shr-tone-over-9000 models list [pedal|amp|cab|rig]\n\
+         shr-tone-over-9000 models install [starter|CATEGORY|ID] [--accept-t3k]\n\
+         shr-tone-over-9000 models verify [starter|CATEGORY|ID]\n\
+         shr-tone-over-9000 models import PATH [--name FILE] [--replace] [IR METADATA]\n\
+         shr-tone-over-9000 models add-url HTTPS_URL --name FILE [--sha256 HASH] [--replace] [IR METADATA]\n\
+         shr-tone-over-9000 models browse [all|pedal|amp|cab|rig]\n\
+         shr-tone-over-9000 models hub COMMAND [OPTIONS]\n\
          \n\
          Common option: --models-dir DIR (default: user data directory)\n\
          IR metadata: --cab-id ID --cabinet LABEL --speaker LABEL --mic LABEL\n\
@@ -712,7 +712,7 @@ mod tests {
         assert!(import_file(&source, Some("cab.wav"), &library, false, None).is_err());
 
         assert!(!library.join("cab.wav").exists());
-        let staging = library.join(".rpi-tone-over-9000-staging");
+        let staging = library.join(".shr-tone-over-9000-staging");
         assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
         fs::remove_dir_all(root).ok();
     }

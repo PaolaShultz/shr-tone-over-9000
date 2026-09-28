@@ -1,3 +1,4 @@
+mod app_paths;
 mod audio;
 mod cab;
 mod catalog;
@@ -67,7 +68,7 @@ impl Options {
             models_dir: model_dir::default_path(),
             controller_config: PathBuf::from("controller.conf"),
             midi_input: None,
-            client_name: "rpi-tone-over-9000".to_owned(),
+            client_name: "shr-tone-over-9000".to_owned(),
             capture_port: "system:capture_1".to_owned(),
             playback_port: "system:playback_1".to_owned(),
             period: None,
@@ -141,10 +142,10 @@ fn next_string(
 
 fn print_help() {
     println!(
-        "rpi-tone-over-9000\n\
+        "shr-tone-over-9000\n\
          \n\
-         Usage: rpi-tone-over-9000 [OPTIONS]\n\
-                rpi-tone-over-9000 models COMMAND [OPTIONS]\n\
+         Usage: shr-tone-over-9000 [OPTIONS]\n\
+                shr-tone-over-9000 models COMMAND [OPTIONS]\n\
          \n\
            --models-dir DIR         NAM/IR directory (default: user data directory)\n\
            --controller-config FILE shr-daw-shaped mapping (default: controller.conf)\n\
@@ -155,7 +156,7 @@ fn print_help() {
            --period 128|256         require this JACK period (default: detect live JACK)\n\
            -h, --help               show this help\n\
          \n\
-         Run `rpi-tone-over-9000 models help` for catalog, download,\n\
+         Run `shr-tone-over-9000 models help` for catalog, download,\n\
          verification, import, and online browse commands."
     );
 }

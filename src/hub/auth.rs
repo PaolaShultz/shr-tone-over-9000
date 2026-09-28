@@ -306,14 +306,15 @@ fn hub_config_path() -> PathBuf {
         return PathBuf::from(path);
     }
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path)
-            .join("rpi-tone-over-9000")
-            .join("hub.conf");
+        return crate::app_paths::application_path(&PathBuf::from(path), "hub.conf");
     }
     if let Some(path) = std::env::var_os("HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path).join(".config/rpi-tone-over-9000/hub.conf");
+        return crate::app_paths::application_path(
+            &PathBuf::from(path).join(".config"),
+            "hub.conf",
+        );
     }
-    PathBuf::from(".").join(".rpi-tone-over-9000-hub.conf")
+    PathBuf::from(".").join(".shr-tone-over-9000-hub.conf")
 }
 
 fn auth_path(options: &AuthOptions) -> PathBuf {
@@ -324,14 +325,15 @@ fn auth_path(options: &AuthOptions) -> PathBuf {
         return PathBuf::from(path);
     }
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path)
-            .join("rpi-tone-over-9000")
-            .join("tone3000-auth.json");
+        return crate::app_paths::application_path(&PathBuf::from(path), "tone3000-auth.json");
     }
     if let Some(path) = std::env::var_os("HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path).join(".config/rpi-tone-over-9000/tone3000-auth.json");
+        return crate::app_paths::application_path(
+            &PathBuf::from(path).join(".config"),
+            "tone3000-auth.json",
+        );
     }
-    PathBuf::from(".").join(".rpi-tone-over-9000-tone3000-auth.json")
+    PathBuf::from(".").join(".shr-tone-over-9000-tone3000-auth.json")
 }
 
 fn random_url_token(bytes: usize) -> Result<String> {

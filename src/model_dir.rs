@@ -5,20 +5,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-const APPLICATION_DIR: &str = "rpi-tone-over-9000";
-
 pub fn default_path() -> PathBuf {
     if let Some(path) = std::env::var_os("RPI_TONE_MODELS_DIR").filter(|path| !path.is_empty()) {
         return PathBuf::from(path);
     }
     if let Some(path) = std::env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path).join(APPLICATION_DIR).join("models");
+        return crate::app_paths::application_path(&PathBuf::from(path), "models");
     }
     if let Some(path) = std::env::var_os("HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path)
-            .join(".local/share")
-            .join(APPLICATION_DIR)
-            .join("models");
+        return crate::app_paths::application_path(
+            &PathBuf::from(path).join(".local/share"),
+            "models",
+        );
     }
     PathBuf::from("models/library")
 }

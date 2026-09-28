@@ -1,5 +1,5 @@
 [package]
-name = "rpi-tone-over-9000"
+name = "shr-tone-over-9000"
 version = "0.1.1"
 edition = "2021"
 rust-version = "1.97"
@@ -7,7 +7,7 @@ description = "Minimal JACK-only NAM amp simulator with a 40x13 Rust TUI"
 license = "MIT"
 
 [[bin]]
-name = "rpi-tone-over-9000"
+name = "shr-tone-over-9000"
 path = "src/main.rs"
 
 [dependencies]
