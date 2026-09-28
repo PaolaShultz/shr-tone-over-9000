@@ -1,18 +1,50 @@
-# shr-tone-over-9000
+![SHR Tone Over 9000 — a chain of three effect blocks](docs/assets/banner.svg)
 
-A minimal Raspberry Pi 5 amp sim: one Rust process, one mono JACK client,
-NeuralAmpModelerCore, cabinet convolution, and one 40×13 terminal screen. It
-chains up to four local `.nam` captures and `.wav` cabinet IRs in any order and
-processes `system:capture_1` to `system:playback_1` at 48 kHz. The normal chain
-is **pedal NAM → amp-head NAM → cabinet IR**.
+# SHR Tone Over 9000
 
-It is not a DAW, plugin host, LV2/CLAP wrapper, preset manager, GUI, or WebView.
-It includes a pinned, checksummed starter catalog, safe local/URL import,
-verification, and TONE3000 metadata search with exact one-model downloads. The
-smart hub flow is available directly in the TUI; its CLI commands remain useful
-for setup and scripting. TONE3000 authentication happens in the user's browser
-or phone through OAuth/PKCE; credentials never enter the audio thread. V1 is
-mono, has no EQ, and keeps oversampling off.
+**A compact NAM amp simulator for Raspberry Pi 5.** Chain up to four `.nam`
+captures and cabinet impulse responses in one Rust process, controlled from a
+40×13 terminal with touch and MIDI input.
+
+[Quick start](#quick-start) · [Models and cabinets](#models-cabinets-and-controls) · [TONE3000 search](#smart-tone3000-search) · [Troubleshooting](#troubleshooting)
+
+### Pedal → amp → cabinet
+
+- **Build your chain:** combine local NAM captures and WAV cabinet IRs in any order.
+- **Find a sound:** browse the starter catalog or search TONE3000 from the terminal.
+- **Keep playing while you browse:** model preparation, authentication and downloads run outside the audio loop.
+
+The current processor is **mono, 48 kHz**, with oversampling off and no EQ.
+It attaches to an existing JACK server and leaves server configuration alone.
+
+## Quick start
+
+On 64-bit Debian 12/13 with rustup installed, the helper installs native
+prerequisites, fetches the NAM core and builds the pinned Rust release:
+
+```sh
+scripts/install.sh --system-deps
+shr-tone-over-9000 --help
+```
+
+This also installs five CC0 cabinet IRs. To install the curated TONE3000 NAM
+captures for local use, review their terms and add `--accept-t3k`.
+
+With your JACK server running at 48 kHz:
+
+```sh
+shr-tone-over-9000
+```
+
+The default route is `system:capture_1` → processor → `system:playback_1`.
+Use `--capture-port` and `--playback-port` for your exact interface ports.
+The [build guide](#raspberry-pi-5-build) includes manual setup and the exact
+Rust 1.97.1 pin.
+
+## Operating guide
+
+<details>
+<summary>Build details, JACK setup, models, TONE3000, MIDI and troubleshooting</summary>
 
 ## Raspberry Pi 5 build
 
@@ -407,3 +439,7 @@ To move an existing installation to the new default layout, close the app,
 move its directories under `~/.local/share/` and `~/.config/` to
 `shr-tone-over-9000` (only if those destinations do not exist), then run
 `scripts/install.sh --no-models`. This preserves model files and credentials.
+
+</details>
+
+[Source repository](https://github.com/PaolaShultz/shr-tone-over-9000)
