@@ -54,3 +54,9 @@ Rust 1.97.1 pin.
 [MIT](LICENSE) for the application. Downloaded NAM models, cabinet IRs and
 external build dependencies retain their own licenses and source terms.
 See the [model catalog](assets/model-catalog.tsv) for asset provenance.
+
+## GigPies integration planning — 2026-10-04
+
+[Owning GigPies plan](docs/plans/GIGPIES_IMPLEMENTATION.md) records scoped tasks, contract dependencies,
+validation and launch instructions. This is planned work; existing implementation
+and hardware status above are unchanged.
