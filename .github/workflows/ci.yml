@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 1
+  PYTHONDONTWRITEBYTECODE: 1
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Build dependency plus source-owned test fixtures; never run install.sh.
+      - name: Check out pinned NAM core
+        uses: actions/checkout@v4
+        with:
+          repository: sdatkinson/NeuralAmpModelerCore
+          ref: 1f42f88535884450104b8711d7595019afa0495b
+          path: vendor/tone3000-plugin/plugin/NeuralAmpModelerCore
+          persist-credentials: false
+          sparse-checkout: |
+            NAM
+            Dependencies/nlohmann
+            example_models
+      - name: Install Linux development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libjack-jackd2-dev libasound2-dev g++ nlohmann-json3-dev libeigen3-dev
+      - name: Install exact Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          rustc +1.97.1 -vV
+      - name: Formatting
+        run: |
+          cargo +1.97.1 fmt --all -- --check
+      - name: Locked check
+        run: |
+          cargo +1.97.1 check --locked --all-targets
+      - name: Normal offline tests
+        run: |
+          cargo +1.97.1 test --locked --all-targets -- --test-threads=1
